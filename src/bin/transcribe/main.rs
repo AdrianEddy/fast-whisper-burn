@@ -1,16 +1,16 @@
+use fast_whisper_burn::MixedPrecisionAdapter;
 use fast_whisper_burn::custom_kernels::CustomKernelsBackend;
 use fast_whisper_burn::model::*;
 use fast_whisper_burn::token::{Gpt2Tokenizer, Language};
-use fast_whisper_burn::transcribe::{transcribe_regions_batched, SamplingStrategy, WhisperParams};
+use fast_whisper_burn::transcribe::{SamplingStrategy, WhisperParams, transcribe_regions_batched};
 use fast_whisper_burn::vad::*;
-use fast_whisper_burn::MixedPrecisionAdapter;
 
 use strum::IntoEnumIterator;
 
 use burn::config::Config;
 use burn_store::ModuleSnapshot;
 use hound::{self, SampleFormat};
-use std::{env, fs, path::Path, process, time::Instant};
+use std::{env, fs, io::Write, path::Path, process, time::Instant};
 
 type WgpuF32 = burn::backend::Wgpu<f32>;
 
@@ -146,6 +146,7 @@ fn main() {
     } else {
         println!("Using f32 precision.");
     }
+
     let use_beam_search = !use_greedy;
 
     run_transcription::<WgpuF32>(
@@ -172,6 +173,10 @@ fn run_transcription<B: CustomKernelsBackend>(
     use_beam_search: bool,
     total_started: Instant,
 ) {
+    let model_started = Instant::now();
+    let (bpe, _whisper_config, whisper) = load_model::<B>(model_name, tensor_device, use_f16);
+    println!("Model loaded in {:.2?}", model_started.elapsed());
+
     let vad_started = Instant::now();
     let vad = match SileroVAD6Model::<B>::new(tensor_device, false) {
         Ok(vad) => vad,
@@ -181,7 +186,19 @@ fn run_transcription<B: CustomKernelsBackend>(
         }
     };
 
-    let speech_regions = match detect_speech_regions(&vad, tensor_device, waveform) {
+    let speech_regions = match detect_speech_regions(
+        &vad,
+        tensor_device,
+        waveform,
+        Some(|offset, len| {
+            print!(
+                "\rVAD progress: {:.2}%",
+                (offset as f64 / len as f64) * 100.0
+            );
+            std::io::stdout().flush().unwrap();
+            true // Continue processing
+        }),
+    ) {
         Ok(regions) => regions,
         Err(e) => {
             eprintln!("Failed to detect speech regions: {e}");
@@ -189,14 +206,10 @@ fn run_transcription<B: CustomKernelsBackend>(
         }
     };
     println!(
-        "VAD finished in {:.2?}. {} speech region(s) detected.",
+        "\rVAD finished in {:.2?}. {} speech region(s) detected.",
         vad_started.elapsed(),
         speech_regions.len()
     );
-
-    let model_started = Instant::now();
-    let (bpe, _whisper_config, whisper) = load_model::<B>(model_name, tensor_device, use_f16);
-    println!("Model loaded in {:.2?}", model_started.elapsed());
 
     let mut params = WhisperParams::default();
     params.print_special = false;
@@ -227,6 +240,14 @@ fn run_transcription<B: CustomKernelsBackend>(
         sample_rate,
         &params,
         None, // use default max batch size
+        Some(|completed, total| {
+            print!(
+                "\rTranscribing: {:.2}%",
+                (completed as f64 / total as f64) * 100.0
+            );
+            std::io::stdout().flush().unwrap();
+            true // Continue processing
+        }),
     ) {
         Ok(results) => results,
         Err(e) => {
@@ -235,15 +256,15 @@ fn run_transcription<B: CustomKernelsBackend>(
         }
     };
 
-    for (index, (region, result)) in speech_regions.iter().zip(batch_results.iter()).enumerate() {
-        println!(
+    for (_index, (region, result)) in speech_regions.iter().zip(batch_results.iter()).enumerate() {
+        /*println!(
             "Region {}/{} [{} ms -> {} ms] ({} segments)",
-            index + 1,
+            _index + 1,
             speech_regions.len(),
             region.start_ms,
             ((region.end_sample as i64) * 1000) / TARGET_SAMPLE_RATE as i64,
             result.segments.len(),
-        );
+        );*/
 
         for segment in &result.segments {
             let text = clean_segment_text(&segment.text);
@@ -258,14 +279,13 @@ fn run_transcription<B: CustomKernelsBackend>(
         }
     }
     println!(
-        "Transcription finished in {:.2?}",
+        "\rTranscription finished in {:.2?}",
         transcription_started.elapsed()
     );
 
     let text = segments_to_text(&segments);
     let srt = segments_to_srt(&segments);
 
-    let write_started = Instant::now();
     // Write plain text transcription
     fs::write(text_file, &text).unwrap_or_else(|e| {
         eprintln!("Error writing transcription file: {e}");
@@ -278,7 +298,6 @@ fn run_transcription<B: CustomKernelsBackend>(
         eprintln!("Error writing SRT file: {e}");
         process::exit(1);
     });
-    println!("Wrote outputs in {:.2?}", write_started.elapsed());
 
     println!("Transcription finished. {} segments.", segments.len());
     println!("Text: {}", text_file);

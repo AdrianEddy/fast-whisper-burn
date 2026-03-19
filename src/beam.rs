@@ -1,13 +1,13 @@
 use crate::custom_kernels::CustomKernelsBackend;
 use crate::model::*;
 use crate::transcribe::{
-    average_cross_attention_for_token, compute_entropy, sequence_score, SamplingStrategy,
-    SegmentDecodeResult, WhisperParams, CHUNK_SIZE,
+    CHUNK_SIZE, SamplingStrategy, SegmentDecodeResult, WhisperParams,
+    average_cross_attention_for_token, compute_entropy, sequence_score,
 };
 use burn::tensor::TensorData;
 use burn::tensor::{
-    activation::{log_softmax, softmax},
     ElementConversion, Int, Tensor,
+    activation::{log_softmax, softmax},
 };
 use std::f32;
 

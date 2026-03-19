@@ -245,10 +245,14 @@ pub fn merge_vad_segments(
         .collect()
 }
 
-pub fn detect_speech_regions<B: crate::custom_kernels::CustomKernelsBackend>(
+pub fn detect_speech_regions<
+    B: crate::custom_kernels::CustomKernelsBackend,
+    F: FnMut(usize, usize) -> bool,
+>(
     vad: &SileroVAD6Model<B>,
     device: &B::Device,
     waveform: &[f32],
+    mut progress_callback: Option<F>,
 ) -> Result<Vec<SpeechRegion>, String> {
     let mut predict_state = PredictState::default(device);
     let chunk_size = predict_state.input_size();
@@ -284,6 +288,11 @@ pub fn detect_speech_regions<B: crate::custom_kernels::CustomKernelsBackend>(
         );
 
         offset = block_end;
+        if let Some(callback) = progress_callback.as_mut() {
+            if !callback(offset, waveform.len()) {
+                break;
+            }
+        }
     }
 
     let vad_segments = whisper_vad_segments_from_probs(&speech_probs, chunk_size);

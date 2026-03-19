@@ -36,7 +36,7 @@ The biggest single optimization. Instead of processing each VAD speech region se
 - **Batched greedy decode** — all N regions are decoded in parallel (batch=N). Each decode step is a single GPU forward pass serving all regions, with lightweight per-region token selection on the CPU. Finished regions are padded with EOT tokens.
 - **Batched beam search** — all N regions × beam_size beams run as a single batch (e.g., 30 regions × 4 beams = batch 120). Per-region beam management (candidate ranking, reordering) happens on the CPU between batched GPU forward passes.
 - **Quality fallback** — if any region's batched output is degenerate (low entropy / repetitive text, failed decode), that specific region is re-decoded sequentially with temperature fallback, paying the retry cost only for the few problematic regions.
-- **Memory-conscious chunking** — regions are processed in configurable chunks (default 16) so that 10-hour recordings with hundreds of regions don't exhaust GPU memory.
+- **Memory-conscious chunking** — regions are processed in configurable chunks (default 10) so that 10-hour recordings with hundreds of regions don't exhaust GPU memory.
 
 ### Net Impact
 

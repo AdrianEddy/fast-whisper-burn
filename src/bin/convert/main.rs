@@ -1,10 +1,10 @@
 use burn::{backend::wgpu::Wgpu, config::Config};
 use burn_store::pytorch::PytorchReader;
 use burn_store::{BurnpackStore, ModuleSnapshot, PytorchStore};
-use std::error::Error;
+use fast_whisper_burn::MixedPrecisionAdapter;
 use fast_whisper_burn::custom_kernels::CustomKernelsBackend;
 use fast_whisper_burn::model::*;
-use fast_whisper_burn::MixedPrecisionAdapter;
+use std::error::Error;
 
 fn save_whisper<B: CustomKernelsBackend>(
     whisper: Whisper<B>,

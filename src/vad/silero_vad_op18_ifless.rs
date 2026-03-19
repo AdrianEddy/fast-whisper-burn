@@ -1,16 +1,16 @@
 // Generated from ONNX "../silero_vad_op18_ifless.onnx" by burn-onnx
-use burn::nn::conv::Conv1d;
-use burn::nn::conv::Conv1dConfig;
 use burn::nn::Linear;
 use burn::nn::LinearConfig;
 use burn::nn::LinearLayout;
 use burn::nn::PaddingConfig1d;
+use burn::nn::conv::Conv1d;
+use burn::nn::conv::Conv1dConfig;
 use burn::prelude::*;
 use burn::tensor::Bytes;
 use burn_store::BurnpackStore;
 use burn_store::ModuleSnapshot;
 
-use crate::custom_kernels::{lstm_cell_fused, CustomKernelsBackend};
+use crate::custom_kernels::{CustomKernelsBackend, lstm_cell_fused};
 
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {

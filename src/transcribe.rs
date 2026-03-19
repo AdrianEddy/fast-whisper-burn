@@ -10,9 +10,9 @@ use burn::{
     backend::ndarray::NdArray,
     module::Module,
     tensor::{
+        ElementConversion, Int, Tensor,
         activation::{log_softmax, softmax},
         backend::Backend,
-        ElementConversion, Int, Tensor,
     },
 };
 use mt19937::MT19937;
@@ -337,25 +337,35 @@ pub fn detect_language<B: CustomKernelsBackend>(
     })
 }
 
-pub fn transcribe<B: CustomKernelsBackend>(
+pub fn transcribe<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
     whisper: &Whisper<B>,
     bpe: &Gpt2Tokenizer,
     waveform: &[f32],
     sample_rate: usize,
     params: &WhisperParams,
+    progress_callback: Option<F>,
 ) -> token::Result<TranscriptionResult> {
-    transcribe_inner(whisper, bpe, waveform, sample_rate, params, None)
+    transcribe_inner(
+        whisper,
+        bpe,
+        waveform,
+        sample_rate,
+        params,
+        None,
+        progress_callback,
+    )
 }
 
 /// Like `transcribe`, but accepts a pre-computed encoder output to skip encoding.
 /// Used by `transcribe_regions_batched` to amortise encoder cost across regions.
-fn transcribe_inner<B: CustomKernelsBackend>(
+fn transcribe_inner<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
     whisper: &Whisper<B>,
     bpe: &Gpt2Tokenizer,
     waveform: &[f32],
     sample_rate: usize,
     params: &WhisperParams,
     pre_encoded: Option<Tensor<B, 3>>,
+    mut progress_callback: Option<F>,
 ) -> token::Result<TranscriptionResult> {
     let device = whisper.devices()[0].clone();
     let n_mels = whisper.encoder_mel_size();
@@ -866,6 +876,12 @@ fn transcribe_inner<B: CustomKernelsBackend>(
         }
 
         seek += seek_delta;
+
+        if let Some(callback) = progress_callback.as_mut() {
+            if !callback(seek, seek_end) {
+                break;
+            }
+        }
     }
 
     let full_text = segments.iter().map(|s| s.text.as_str()).collect::<String>();
@@ -881,7 +897,7 @@ fn transcribe_inner<B: CustomKernelsBackend>(
 // ═══════════════════════════════════════════════════
 
 /// Maximum number of regions to process in a single GPU batch.
-const DEFAULT_MAX_BATCH_SIZE: usize = 8;
+const DEFAULT_MAX_BATCH_SIZE: usize = 10;
 
 /// Transcribe multiple waveform regions in batched GPU passes.
 ///
@@ -891,23 +907,43 @@ const DEFAULT_MAX_BATCH_SIZE: usize = 8;
 ///
 /// Falls back to sequential `transcribe()` for beam-search or sampling
 /// (temperature > 0) strategies.
-pub fn transcribe_regions_batched<B: CustomKernelsBackend>(
+pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
     whisper: &Whisper<B>,
     bpe: &Gpt2Tokenizer,
     regions: &[&[f32]],
     sample_rate: usize,
     params: &WhisperParams,
     max_batch_size: Option<usize>,
+    mut progress_callback: Option<F>,
 ) -> token::Result<Vec<TranscriptionResult>> {
     let max_batch = max_batch_size.unwrap_or(DEFAULT_MAX_BATCH_SIZE).max(1);
+    let total_regions = regions.len();
+    let mut completed_regions = 0usize;
 
     // Both greedy and beam search get fully batched decode.
     // Only fall back to sequential for sampling (temperature > 0).
     if params.temperature > 0.0 {
-        return regions
-            .iter()
-            .map(|waveform| transcribe(whisper, bpe, waveform, sample_rate, params))
-            .collect();
+        let mut results = Vec::with_capacity(total_regions);
+        for (i, waveform) in regions.iter().enumerate() {
+            results.push(transcribe(
+                whisper,
+                bpe,
+                waveform,
+                sample_rate,
+                params,
+                None::<fn(usize, usize) -> bool>,
+            )?);
+            if let Some(callback) = progress_callback.as_mut() {
+                if !callback(i + 1, total_regions) {
+                    results.resize_with(total_regions, || TranscriptionResult {
+                        segments: Vec::new(),
+                        text: String::new(),
+                    });
+                    return Ok(results);
+                }
+            }
+        }
+        return Ok(results);
     }
 
     let use_beam = matches!(params.strategy, SamplingStrategy::BeamSearch { .. });
@@ -1051,7 +1087,20 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend>(
     for (i, waveform) in regions.iter().enumerate() {
         if waveform.len() > max_samples_for_batch {
             // Too long for single-pass batching → sequential with full seek loop
-            all_results[i] = transcribe(whisper, bpe, waveform, sample_rate, params)?;
+            all_results[i] = transcribe(
+                whisper,
+                bpe,
+                waveform,
+                sample_rate,
+                params,
+                None::<fn(usize, usize) -> bool>,
+            )?;
+            completed_regions += 1;
+            if let Some(callback) = progress_callback.as_mut() {
+                if !callback(completed_regions, total_regions) {
+                    return Ok(all_results);
+                }
+            }
         } else {
             batchable_indices.push(i);
         }
@@ -1122,8 +1171,14 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend>(
 
                 let out_idx = batch_indices[r];
                 if needs_fallback && params.temperature_inc > 0.0 {
-                    all_results[out_idx] =
-                        transcribe(whisper, bpe, batch_regions[r], sample_rate, params)?;
+                    all_results[out_idx] = transcribe(
+                        whisper,
+                        bpe,
+                        batch_regions[r],
+                        sample_rate,
+                        params,
+                        None::<fn(usize, usize) -> bool>,
+                    )?;
                     continue;
                 }
 
@@ -1152,6 +1207,12 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend>(
                 }
                 let text = segments.iter().map(|s| s.text.as_str()).collect::<String>();
                 all_results[out_idx] = TranscriptionResult { segments, text };
+            }
+            completed_regions += batch_indices.len();
+            if let Some(callback) = progress_callback.as_mut() {
+                if !callback(completed_regions, total_regions) {
+                    return Ok(all_results);
+                }
             }
             continue;
         }
@@ -1364,8 +1425,14 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend>(
 
             let out_idx = batch_indices[r];
             if needs_fallback && params.temperature_inc > 0.0 {
-                all_results[out_idx] =
-                    transcribe(whisper, bpe, batch_regions[r], sample_rate, params)?;
+                all_results[out_idx] = transcribe(
+                    whisper,
+                    bpe,
+                    batch_regions[r],
+                    sample_rate,
+                    params,
+                    None::<fn(usize, usize) -> bool>,
+                )?;
                 continue;
             }
 
@@ -1398,6 +1465,13 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend>(
 
             let text = segments.iter().map(|s| s.text.as_str()).collect::<String>();
             all_results[out_idx] = TranscriptionResult { segments, text };
+        }
+
+        completed_regions += batch_indices.len();
+        if let Some(callback) = progress_callback.as_mut() {
+            if !callback(completed_regions, total_regions) {
+                return Ok(all_results);
+            }
         }
     }
 

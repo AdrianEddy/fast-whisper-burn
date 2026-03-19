@@ -1,6 +1,6 @@
 use burn::tensor::{
-    activation::relu, backend::Backend, cast::ToElement, BasicOps, Element, Numeric, Tensor,
-    TensorKind,
+    BasicOps, Element, Numeric, Tensor, TensorKind, activation::relu, backend::Backend,
+    cast::ToElement,
 };
 
 pub fn tensor_max_scalar<B: Backend, const D: usize>(x: Tensor<B, D>, max: f64) -> Tensor<B, D> {
