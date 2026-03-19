@@ -2,7 +2,9 @@ use fast_whisper_burn::MixedPrecisionAdapter;
 use fast_whisper_burn::custom_kernels::CustomKernelsBackend;
 use fast_whisper_burn::model::*;
 use fast_whisper_burn::token::{Gpt2Tokenizer, Language};
-use fast_whisper_burn::transcribe::{SamplingStrategy, WhisperParams, transcribe_regions_batched};
+use fast_whisper_burn::transcribe::{
+    SamplingStrategy, TokenTimestamp, WhisperParams, transcribe_regions_batched,
+};
 use fast_whisper_burn::vad::*;
 
 use strum::IntoEnumIterator;
@@ -21,6 +23,7 @@ struct TranscriptSegment {
     start_ms: i64,
     end_ms: i64,
     text: String,
+    token_timestamps: Vec<TokenTimestamp>,
 }
 
 fn load_audio_waveform(filename: &str) -> hound::Result<(Vec<f32>, usize)> {
@@ -103,6 +106,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let use_f16 = args.iter().any(|a| a == "--f16");
     let use_greedy = args.iter().any(|a| a == "--greedy");
+    let use_token_ts = args.iter().any(|a| a == "--token-timestamps");
     let pos_args: Vec<&str> = args
         .iter()
         .map(|s| s.as_str())
@@ -111,7 +115,7 @@ fn main() {
 
     if pos_args.len() < 5 {
         eprintln!(
-            "Usage: {} <model name> <audio file> <lang> <transcription file> [--f16] [--greedy] [--beam]",
+            "Usage: {} <model name> <audio file> <lang> <transcription file> [--f16] [--greedy] [--beam] [--token-timestamps]",
             pos_args[0]
         );
         process::exit(1);
@@ -158,6 +162,7 @@ fn main() {
         text_file,
         use_f16,
         use_beam_search,
+        use_token_ts,
         total_started,
     );
 }
@@ -171,6 +176,7 @@ fn run_transcription<B: CustomKernelsBackend>(
     text_file: &str,
     use_f16: bool,
     use_beam_search: bool,
+    use_token_timestamps: bool,
     total_started: Instant,
 ) {
     let model_started = Instant::now();
@@ -223,6 +229,7 @@ fn run_transcription<B: CustomKernelsBackend>(
         params.strategy = SamplingStrategy::Greedy { best_of: -1 };
     }
     params.use_f16_compute = use_f16;
+    params.token_timestamps = use_token_timestamps;
 
     let mut segments = Vec::new();
     let transcription_started = Instant::now();
@@ -271,10 +278,22 @@ fn run_transcription<B: CustomKernelsBackend>(
             if text.is_empty() {
                 continue;
             }
+            let token_timestamps: Vec<TokenTimestamp> = segment
+                .token_timestamps
+                .iter()
+                .map(|tt| TokenTimestamp {
+                    token_id: tt.token_id,
+                    text: tt.text.clone(),
+                    t0: region.start_ms / 10 + tt.t0,
+                    t1: region.start_ms / 10 + tt.t1,
+                    pt: tt.pt,
+                })
+                .collect();
             segments.push(TranscriptSegment {
                 start_ms: region.start_ms + segment.t0 * 10,
                 end_ms: region.start_ms + segment.t1 * 10,
                 text,
+                token_timestamps,
             });
         }
     }
@@ -299,7 +318,60 @@ fn run_transcription<B: CustomKernelsBackend>(
         process::exit(1);
     });
 
-    println!("Transcription finished. {} segments.", segments.len());
+    // Write token-level timestamps if enabled
+    if use_token_timestamps {
+        let tsv_file = Path::new(text_file).with_extension("tokens.tsv");
+        let mut tsv = String::from("start_ms\tend_ms\ttoken\tconfidence\n");
+        for seg in &segments {
+            for tt in &seg.token_timestamps {
+                let t = tt.text.replace('\t', " ").replace('\n', " ");
+                tsv.push_str(&format!(
+                    "{}\t{}\t{}\t{:.4}\n",
+                    tt.t0 * 10,
+                    tt.t1 * 10,
+                    t,
+                    tt.pt
+                ));
+            }
+        }
+        fs::write(&tsv_file, &tsv).unwrap_or_else(|e| {
+            eprintln!("Error writing token timestamps file: {e}");
+            process::exit(1);
+        });
+
+        // Print a sample of token timestamps to console
+        println!("\n--- Token-level timestamps (first 30 tokens) ---");
+        println!(
+            "{:<12} {:<12} {:<8} {}",
+            "start_ms", "end_ms", "conf", "token"
+        );
+        let mut count = 0;
+        for seg in &segments {
+            for tt in &seg.token_timestamps {
+                if count >= 30 {
+                    break;
+                }
+                println!(
+                    "{:<12} {:<12} {:<8.4} {:?}",
+                    tt.t0 * 10,
+                    tt.t1 * 10,
+                    tt.pt,
+                    tt.text
+                );
+                count += 1;
+            }
+            if count >= 30 {
+                break;
+            }
+        }
+        let total_tokens: usize = segments.iter().map(|s| s.token_timestamps.len()).sum();
+        if total_tokens > 30 {
+            println!("... ({} more tokens)", total_tokens - 30);
+        }
+        println!("Token TSV: {}", tsv_file.display());
+    }
+
+    println!("\nTranscription finished. {} segments.", segments.len());
     println!("Text: {}", text_file);
     println!("SRT:  {}", srt_file.display());
     println!("Total elapsed: {:.2?}", total_started.elapsed());

@@ -1188,12 +1188,13 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
                     && decode_result.avg_logprobs < params.logprob_thold as f64;
 
                 let tokens_cur = decode_result.tokens;
+                let alignments_cur = decode_result.token_alignments;
                 let mut segments = Vec::new();
                 if !tokens_cur.is_empty() && !is_no_speech {
                     build_segments_from_tokens(
                         bpe,
                         &tokens_cur,
-                        &[],
+                        &alignments_cur,
                         token_eot,
                         token_beg,
                         0, // seek
@@ -1260,6 +1261,17 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
         let all_logits_data = batched_logits.into_data().convert::<f32>();
         let all_logits_flat = all_logits_data.to_vec::<f32>().unwrap();
 
+        // Extract per-region cross-attention from prompt output
+        let mut pending_attention: Vec<Vec<f32>> = if params.token_timestamps {
+            average_cross_attention_batched(
+                &prompt_output.cross_attention_weights,
+                prompt_len - 1,
+                batch_size,
+            )
+        } else {
+            vec![Vec::new(); batch_size]
+        };
+
         // 5. Per-region decode state
         let mut no_speech_probs: Vec<f32> = Vec::with_capacity(batch_size);
         let mut states: Vec<RegionStateInner> = (0..batch_size)
@@ -1281,6 +1293,7 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
 
                 RegionStateInner {
                     tokens_out: Vec::new(),
+                    token_alignments: Vec::new(),
                     seek_delta: CHUNK_SIZE * 100,
                     result_len: 0,
                     has_ts: false,
@@ -1311,6 +1324,9 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
                 effective_audio_ctx,
             );
             states[r].next_token = token.0;
+            states[r]
+                .token_alignments
+                .push(std::mem::take(&mut pending_attention[r]));
             // Process token
             process_decoded_token(
                 &mut states[r],
@@ -1365,6 +1381,17 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
 
             cache = step_output.cache;
 
+            // Extract cross-attention for token timestamps
+            pending_attention = if params.token_timestamps {
+                average_cross_attention_batched(
+                    &step_output.cross_attention_weights,
+                    0, // single-token step → position 0
+                    batch_size,
+                )
+            } else {
+                vec![Vec::new(); batch_size]
+            };
+
             // Pull logits to CPU: [N, 1, vocab_size] → [N * vocab_size]
             let logits_2d: Tensor<B, 2> = step_output.logits.reshape([batch_size, vocab_size]);
             let logits_data = logits_2d.into_data().convert::<f32>();
@@ -1394,6 +1421,9 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
                     effective_audio_ctx,
                 );
                 states[r].next_token = token.0;
+                states[r]
+                    .token_alignments
+                    .push(std::mem::take(&mut pending_attention[r]));
                 process_decoded_token(
                     &mut states[r],
                     token,
@@ -1441,8 +1471,10 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
             let is_no_speech =
                 no_speech_prob > params.no_speech_thold && avg_lp < params.logprob_thold as f64;
 
-            let tokens_cur: Vec<(usize, f64, usize)> =
-                state.tokens_out[..state.result_len.min(state.tokens_out.len())].to_vec();
+            let result_end = state.result_len.min(state.tokens_out.len());
+            let tokens_cur: Vec<(usize, f64, usize)> = state.tokens_out[..result_end].to_vec();
+            let alignments_cur: Vec<Vec<f32>> =
+                state.token_alignments[..result_end.min(state.token_alignments.len())].to_vec();
             let seek_delta = state.seek_delta;
 
             let mut segments = Vec::new();
@@ -1450,7 +1482,7 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
                 build_segments_from_tokens(
                     bpe,
                     &tokens_cur,
-                    &[], // no token alignments in batched mode
+                    &alignments_cur,
                     token_eot,
                     token_beg,
                     seek,
@@ -1673,6 +1705,7 @@ fn process_decoded_token(
 /// Per-region decode state for batched transcription.
 struct RegionStateInner {
     tokens_out: Vec<(usize, f64, usize)>,
+    token_alignments: Vec<Vec<f32>>,
     seek_delta: usize,
     result_len: usize,
     has_ts: bool,
@@ -1691,7 +1724,7 @@ fn compute_avg_logprob(tokens: &[(usize, f64, usize)], result_len: usize) -> f64
 fn build_segments_from_tokens(
     bpe: &Gpt2Tokenizer,
     tokens_cur: &[(usize, f64, usize)],
-    _token_alignments: &[Vec<f32>],
+    token_alignments: &[Vec<f32>],
     token_eot: usize,
     token_beg: usize,
     seek: usize,
@@ -1707,6 +1740,7 @@ fn build_segments_from_tokens(
     let mut t0 = seek as i64 + 2 * (tokens_cur[0].2 as i64 - token_beg as i64);
     let mut text = String::new();
     let mut speaker_turn_next = false;
+    let mut seg_token_indices: Vec<usize> = Vec::new();
     let mut i = 0;
 
     while i < tokens_cur.len() {
@@ -1716,6 +1750,7 @@ fn build_segments_from_tokens(
             if let Ok(decoded) = bpe.decode(&[token_id], true) {
                 text += &decoded;
             }
+            seg_token_indices.push(i);
         }
 
         if params.tdrz_enable && token_solm == Some(token_id) {
@@ -1725,16 +1760,41 @@ fn build_segments_from_tokens(
         if token_id > token_beg && !params.single_segment {
             let t1 = seek as i64 + 2 * (tid as i64 - token_beg as i64);
             if !text.is_empty() {
-                segments.push(TranscriptionSegment {
+                let tok_ts = if params.token_timestamps {
+                    compute_token_timestamps_for_segment(
+                        bpe,
+                        tokens_cur,
+                        token_alignments,
+                        &seg_token_indices,
+                        seek as i64,
+                        t0,
+                        t1,
+                        token_beg,
+                        token_eot,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+                let seg = TranscriptionSegment {
                     t0,
                     t1,
                     text: text.clone(),
                     no_speech_prob,
-                    token_timestamps: Vec::new(),
+                    token_timestamps: tok_ts,
                     speaker_turn_next,
-                });
+                };
+
+                if params.max_len > 0 && params.token_timestamps {
+                    let mut split =
+                        split_segment_by_length(&seg, params.max_len, params.split_on_word);
+                    segments.append(&mut split);
+                } else {
+                    segments.push(seg);
+                }
             }
             text.clear();
+            seg_token_indices.clear();
             speaker_turn_next = false;
             t0 = t1;
         }
@@ -1748,14 +1808,38 @@ fn build_segments_from_tokens(
         } else {
             t0
         };
-        segments.push(TranscriptionSegment {
+
+        let tok_ts = if params.token_timestamps {
+            compute_token_timestamps_for_segment(
+                bpe,
+                tokens_cur,
+                token_alignments,
+                &seg_token_indices,
+                seek as i64,
+                t0,
+                t1,
+                token_beg,
+                token_eot,
+            )
+        } else {
+            Vec::new()
+        };
+
+        let seg = TranscriptionSegment {
             t0,
             t1,
             text,
             no_speech_prob,
-            token_timestamps: Vec::new(),
+            token_timestamps: tok_ts,
             speaker_turn_next,
-        });
+        };
+
+        if params.max_len > 0 && params.token_timestamps {
+            let mut split = split_segment_by_length(&seg, params.max_len, params.split_on_word);
+            segments.append(&mut split);
+        } else {
+            segments.push(seg);
+        }
     }
 }
 
@@ -1767,6 +1851,7 @@ fn build_segments_from_tokens(
 #[derive(Clone)]
 struct BatchedBeamDecoder {
     tokens_out: Vec<(usize, f64, usize)>,
+    token_alignments: Vec<Vec<f32>>,
     full_tokens: Vec<usize>,
     sum_logprobs_all: f64,
     seek_delta: usize,
@@ -1876,6 +1961,17 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
         no_speech_probs.push(nsp);
     }
 
+    // Extract per-beam cross-attention from prompt output
+    let mut beam_pending_attention: Vec<Vec<f32>> = if params.token_timestamps {
+        average_cross_attention_batched(
+            &prompt_output.cross_attention_weights,
+            prompt.len() - 1,
+            total_beams,
+        )
+    } else {
+        vec![Vec::new(); total_beams]
+    };
+
     // Initialize per-region beam states
     let initial_tokens = prompt.to_vec();
     let mut region_beams: Vec<Vec<BatchedBeamDecoder>> = (0..n_regions)
@@ -1883,6 +1979,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
             (0..beam_size)
                 .map(|_| BatchedBeamDecoder {
                     tokens_out: Vec::new(),
+                    token_alignments: Vec::new(),
                     full_tokens: initial_tokens.clone(),
                     sum_logprobs_all: 0.0,
                     seek_delta: CHUNK_SIZE * 100,
@@ -1957,6 +2054,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
                 sum_logprobs_all: f64,
                 full_tokens: Vec<usize>,
                 tokens_out: Vec<(usize, f64, usize)>,
+                token_alignments: Vec<Vec<f32>>,
                 seek_delta: usize,
                 has_ts: bool,
             }
@@ -2086,6 +2184,10 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
                     let mut new_full_tokens = beams[b].full_tokens.clone();
                     new_full_tokens.push(sampled_id);
 
+                    // Carry alignment history from source beam + current step's attention
+                    let mut new_alignments = beams[b].token_alignments.clone();
+                    new_alignments.push(beam_pending_attention[global_idx].clone());
+
                     candidates.push(Candidate {
                         beam_idx: b,
                         token_id: sampled_id,
@@ -2094,6 +2196,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
                         sum_logprobs_all: beams[b].sum_logprobs_all + log_prob,
                         full_tokens: new_full_tokens,
                         tokens_out: new_tokens_out,
+                        token_alignments: new_alignments,
                         seek_delta: beams[b].seek_delta,
                         has_ts: beams[b].has_ts,
                     });
@@ -2121,6 +2224,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
                 global_reorder[base + b] = (base + sel.beam_idx) as i32;
 
                 beams[b].tokens_out = sel.tokens_out.clone();
+                beams[b].token_alignments = sel.token_alignments.clone();
                 beams[b].full_tokens = sel.full_tokens.clone();
                 beams[b].sum_logprobs_all = sel.sum_logprobs_all;
                 beams[b].seek_delta = sel.seek_delta;
@@ -2217,6 +2321,17 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
 
         batched_cache = step_output.cache;
 
+        // Extract per-beam cross-attention for token timestamps
+        beam_pending_attention = if params.token_timestamps {
+            average_cross_attention_batched(
+                &step_output.cross_attention_weights,
+                0, // single-token step → position 0
+                total_beams,
+            )
+        } else {
+            vec![Vec::new(); total_beams]
+        };
+
         // Extract per-beam logits
         let logits_2d: Tensor<B, 2> = step_output.logits.reshape([total_beams, vocab_size]);
         let logits_data = logits_2d.into_data().convert::<f32>();
@@ -2250,13 +2365,16 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
 
             if let Some(best) = best {
                 let tokens: Vec<(usize, f64, usize)> = best.tokens_out[..best.result_len].to_vec();
+                let alignments: Vec<Vec<f32>> = best.token_alignments
+                    [..best.result_len.min(best.token_alignments.len())]
+                    .to_vec();
                 let sum_logprobs: f64 = tokens.iter().map(|t| t.1).sum();
                 let avg_logprobs = sum_logprobs / best.result_len.max(1) as f64;
                 let entropy = compute_entropy(&tokens);
 
                 SegmentDecodeResult {
                     tokens,
-                    token_alignments: Vec::new(),
+                    token_alignments: alignments,
                     seek_delta: best.seek_delta,
                     result_len: best.result_len,
                     sum_logprobs,
@@ -2864,16 +2982,19 @@ fn compute_token_timestamps_for_segment(
             );
         }
 
-        let weighted_index: f32 = alignment
+        // Use argmax (peak attention position) instead of weighted mean.
+        // Weighted mean is dominated by background noise when attention is
+        // only moderately focused (e.g. peak 7% vs uniform 0.07%), causing
+        // the center of mass to fall near the middle of the context rather
+        // than at the actual speech position.
+        let (peak_pos, peak) = alignment
             .iter()
             .enumerate()
-            .map(|(index, &weight)| index as f32 * weight)
-            .sum::<f32>()
-            / total;
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, &v)| (i, v))
+            .unwrap();
 
-        let peak = alignment.iter().copied().fold(0.0f32, f32::max);
-
-        centers.push(seek as f32 + weighted_index * 2.0);
+        centers.push(seek as f32 + peak_pos as f32 * 2.0);
         peaks.push(peak);
     }
 
@@ -2961,6 +3082,13 @@ fn compute_uniform_token_timestamps_for_segment(
         .collect()
 }
 
+/// Extract cross-attention alignment for a single token.
+///
+/// Uses only the **last decoder layer** and takes the **element-wise max across
+/// heads** instead of averaging all layers/heads.  Most attention heads don't
+/// track audio-text alignment; averaging them drowns the signal from the few
+/// "alignment heads" that do.  The last layer has the strongest alignment signal,
+/// and max-over-heads preserves it even when most heads attend elsewhere.
 pub(crate) fn average_cross_attention_for_token<B: CustomKernelsBackend>(
     cross_attention_weights: &[Tensor<B, 4>],
     token_index: usize,
@@ -2969,35 +3097,66 @@ pub(crate) fn average_cross_attention_for_token<B: CustomKernelsBackend>(
         return Vec::new();
     }
 
-    let n_ctx = cross_attention_weights[0].dims()[3];
-    let mut head_slices: Vec<Tensor<B, 2>> = Vec::new();
-
-    for layer_weights in cross_attention_weights {
-        let [_batch, n_head, n_qctx, layer_ctx] = layer_weights.dims();
-        if token_index >= n_qctx || layer_ctx != n_ctx {
-            continue;
-        }
-
-        // [1, n_head, 1, n_ctx] -> [n_head, n_ctx]: average on GPU instead of pulling per-layer
-        let slice = layer_weights
-            .clone()
-            .slice([0..1, 0..n_head, token_index..token_index + 1, 0..n_ctx])
-            .reshape([n_head, n_ctx]);
-        head_slices.push(slice);
-    }
-
-    if head_slices.is_empty() {
+    // Use only the last layer (best alignment signal)
+    let layer_weights = cross_attention_weights.last().unwrap();
+    let [_batch, n_head, n_qctx, n_ctx] = layer_weights.dims();
+    if token_index >= n_qctx {
         return vec![0.0f32; n_ctx];
     }
 
-    // Average across all heads of all layers on GPU, then pull only the result
-    Tensor::cat(head_slices, 0)
-        .mean_dim(0)
+    // [1, n_head, 1, n_ctx] → [n_head, n_ctx], then max across heads → [n_ctx]
+    let heads = layer_weights
+        .clone()
+        .slice([0..1, 0..n_head, token_index..token_index + 1, 0..n_ctx])
+        .reshape([n_head, n_ctx]);
+
+    heads
+        .max_dim(0)
         .reshape([n_ctx])
         .into_data()
         .convert::<f32>()
         .to_vec::<f32>()
         .unwrap()
+}
+
+/// Like `average_cross_attention_for_token` but for a batched forward pass.
+/// Returns one `Vec<f32>` per batch element, each of length `n_audio_ctx`.
+/// Batched version of `average_cross_attention_for_token`.
+/// Uses last layer + max-over-heads (see docs on the single-element version).
+/// Performs a single GPU→CPU transfer for the whole batch.
+fn average_cross_attention_batched<B: CustomKernelsBackend>(
+    cross_attention_weights: &[Tensor<B, 4>],
+    token_index: usize,
+    batch_size: usize,
+) -> Vec<Vec<f32>> {
+    if cross_attention_weights.is_empty() || batch_size == 0 {
+        return vec![Vec::new(); batch_size];
+    }
+
+    // Use only the last layer (best alignment signal)
+    let layer_weights = cross_attention_weights.last().unwrap();
+    let [_b, n_head, n_qctx, n_ctx] = layer_weights.dims();
+    if token_index >= n_qctx {
+        return vec![vec![0.0f32; n_ctx]; batch_size];
+    }
+
+    // [batch, n_head, 1, n_ctx] → [batch, n_head, n_ctx], max over heads → [batch, n_ctx]
+    let heads = layer_weights
+        .clone()
+        .slice([
+            0..batch_size,
+            0..n_head,
+            token_index..token_index + 1,
+            0..n_ctx,
+        ])
+        .reshape([batch_size, n_head, n_ctx]);
+
+    let maxed: Tensor<B, 2> = heads.max_dim(1).reshape([batch_size, n_ctx]);
+    let flat = maxed.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+
+    (0..batch_size)
+        .map(|b| flat[b * n_ctx..(b + 1) * n_ctx].to_vec())
+        .collect()
 }
 
 /// Split a segment into multiple sub-segments if it exceeds max_len characters

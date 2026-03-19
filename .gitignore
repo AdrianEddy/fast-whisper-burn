@@ -19,4 +19,5 @@ models
 *.pt
 vid.wav
 transcription*.srt
+transcription*.tsv
 transcription.txt

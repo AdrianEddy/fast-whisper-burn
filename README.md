@@ -77,6 +77,8 @@ The input must be 16 kHz mono WAV:
 
 ```bash
 sox audio.wav -r 16000 -c 1 audio16k.wav
+# or
+ffmpeg -i audio.wav -ar 16000 -ac 1 audio16k.wav
 ```
 
 ### 3. Transcribe
