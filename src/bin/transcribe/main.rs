@@ -334,10 +334,14 @@ fn load_model<B: CustomKernelsBackend>(
     println!("Loading model from {bpk_path}...");
     let whisper: Whisper<B> = {
         let mut store = burn_store::BurnpackStore::from_file(&bpk_path);
-        if use_f16 {
+        let target_dtype = if use_f16 {
             // Mixed precision: cast most weights to f16, keep LayerNorm/embeddings in f32
-            store = store.with_from_adapter(MixedPrecisionAdapter);
-        }
+            burn::tensor::DType::F16
+        } else {
+            // This allows us to load the f16 model but still run it in f32
+            burn::tensor::DType::F32
+        };
+        store = store.with_from_adapter(MixedPrecisionAdapter(target_dtype));
         let mut whisper_model = whisper_config.init(tensor_device_ref);
         let load_result = whisper_model.load_from(&mut store);
         match load_result {

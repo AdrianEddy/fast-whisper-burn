@@ -729,14 +729,87 @@ pub struct ResidualEncoderAttentionBlock<B: Backend> {
     mlp_ln: nn::LayerNorm<B>,
 }
 
+/// Number of query positions to process at once in chunked encoder attention.
+/// Reduces peak VRAM from O(batch * heads * seq² ) to O(batch * heads * chunk * seq).
+/// 256 is a good balance: for seq=1500, peak attention scores drop from
+/// 1500×1500 = 2.25M to 256×1500 = 384K entries per head (~6× reduction).
+const ENCODER_ATTN_CHUNK: usize = 256;
+
 impl<B: CustomKernelsBackend> ResidualEncoderAttentionBlock<B> {
     fn forward(&self, x: Tensor<B, 3>, use_f16: bool) -> Tensor<B, 3> {
         let ln_out = layer_norm_mixed(&self.attn_ln, x.clone(), use_f16);
-        let attn_out = self.attn.forward(MhaInput::self_attn(ln_out)).context;
+        let attn_out = self.chunked_self_attention(ln_out, use_f16);
+
         let x = x + attn_out;
 
         let mlp_input = layer_norm_mixed(&self.mlp_ln, x.clone(), use_f16);
         x + self.mlp.forward(mlp_input)
+    }
+
+    /// Chunked self-attention: processes queries in blocks of ENCODER_ATTN_CHUNK
+    /// to avoid allocating the full [batch, heads, seq, seq] score matrix.
+    fn chunked_self_attention(&self, x: Tensor<B, 3>, use_f16: bool) -> Tensor<B, 3> {
+        let mha = &self.attn;
+        let [batch, seq_len, d_model] = x.dims();
+        let n_heads = mha.n_heads;
+        let d_k = mha.d_k;
+
+        // Project Q, K, V: [batch, seq, d_model] -> [batch, heads, seq, d_k]
+        let q = mha
+            .query
+            .forward(x.clone())
+            .reshape([batch, seq_len, n_heads, d_k])
+            .swap_dims(1, 2);
+        let k = mha
+            .key
+            .forward(x.clone())
+            .reshape([batch, seq_len, n_heads, d_k])
+            .swap_dims(1, 2);
+        let v = mha
+            .value
+            .forward(x)
+            .reshape([batch, seq_len, n_heads, d_k])
+            .swap_dims(1, 2);
+
+        let scale: f64 = 1.0 / (d_k as f64).sqrt();
+
+        // If sequence is short enough, fall back to standard full attention
+        if seq_len <= ENCODER_ATTN_CHUNK {
+            let scores = q.matmul(k.transpose()) * scale;
+            let weights = softmax_mixed(scores, 3, use_f16);
+            let context = weights
+                .matmul(v)
+                .swap_dims(1, 2)
+                .reshape([batch, seq_len, d_model]);
+            return mha.output.forward(context);
+        }
+
+        // Chunked: process query blocks against full K, V
+        let n_chunks = (seq_len + ENCODER_ATTN_CHUNK - 1) / ENCODER_ATTN_CHUNK;
+        let mut chunk_outputs: Vec<Tensor<B, 4>> = Vec::with_capacity(n_chunks);
+
+        for chunk_idx in 0..n_chunks {
+            let q_start = chunk_idx * ENCODER_ATTN_CHUNK;
+            let q_end = (q_start + ENCODER_ATTN_CHUNK).min(seq_len);
+
+            // q_chunk: [batch, heads, chunk_len, d_k]
+            let q_chunk = q
+                .clone()
+                .slice([0..batch, 0..n_heads, q_start..q_end, 0..d_k]);
+
+            // scores: [batch, heads, chunk_len, seq_len] — much smaller than [seq, seq]
+            let scores = q_chunk.matmul(k.clone().transpose()) * scale;
+            let weights = softmax_mixed(scores, 3, use_f16);
+            // out_chunk: [batch, heads, chunk_len, d_k]
+            let out_chunk = weights.matmul(v.clone());
+            chunk_outputs.push(out_chunk);
+        }
+
+        // Concatenate chunks along the sequence dimension (dim 2)
+        let context = Tensor::cat(chunk_outputs, 2)
+            .swap_dims(1, 2)
+            .reshape([batch, seq_len, d_model]);
+        mha.output.forward(context)
     }
 }
 
@@ -962,9 +1035,9 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
             v_new
         };
 
-        // For single-query decoding with f16, use fused attention kernel
+        // For single-query decoding, use fused attention kernel
         // (Q@K^T·scale → softmax → @V in one pass, no intermediate tensors)
-        let context = if seq_len == 1 && use_f16 && mask.is_none() {
+        let context = if seq_len == 1 && mask.is_none() {
             fused_single_query_attn::<B>(q, k.clone(), v.clone())
                 .swap_dims(1, 2)
                 .reshape([batch_size, 1, n_heads * d_k])

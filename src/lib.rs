@@ -12,7 +12,7 @@ use burn_store::{ModuleAdapter, TensorSnapshot};
 /// Mixed precision adapter: casts most F32 weights to F16 for faster compute,
 /// but keeps LayerNorm and embedding weights in F32 for numerical stability.
 #[derive(Debug, Clone)]
-pub struct MixedPrecisionAdapter;
+pub struct MixedPrecisionAdapter(pub burn::tensor::DType);
 
 impl MixedPrecisionAdapter {
     fn is_precision_critical(path_stack: &[String]) -> bool {
@@ -32,8 +32,9 @@ impl ModuleAdapter for MixedPrecisionAdapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
         use burn::tensor::DType;
         use std::rc::Rc;
+        let dtype = self.0;
 
-        if snapshot.dtype != DType::F32 {
+        if snapshot.dtype != DType::F32 && snapshot.dtype != DType::F16 {
             return snapshot.clone();
         }
 
@@ -45,12 +46,12 @@ impl ModuleAdapter for MixedPrecisionAdapter {
         let original_data_fn = snapshot.clone_data_fn();
         let cast_data_fn = Rc::new(move || {
             let data = original_data_fn()?;
-            Ok(data.convert_dtype(DType::F16))
+            Ok(data.convert_dtype(dtype))
         });
 
         TensorSnapshot::from_closure(
             cast_data_fn,
-            DType::F16,
+            dtype,
             snapshot.shape.clone(),
             snapshot.path_stack.clone().unwrap_or_default(),
             snapshot.container_stack.clone().unwrap_or_default(),

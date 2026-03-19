@@ -9,6 +9,7 @@
 use burn::nn;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor as BurnTensor, TensorPrimitive};
+use burn_backend::DType;
 use burn_backend::TensorMetadata;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_dtype;
@@ -662,18 +663,36 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
     };
     let cube_count = CubeCount::Static(n_cubes as u32, 1, 1);
 
-    fused_single_query_attn_kernel::launch::<half::f16, f32, R>(
-        &client,
-        cube_count,
-        cube_dim,
-        q.into_tensor_arg(),
-        k.into_tensor_arg(),
-        v.into_tensor_arg(),
-        output.clone().into_tensor_arg(),
-        n_kv as u32,
-        d_k as u32,
-        n_stripes as u32,
-    );
+    match q.dtype {
+        DType::F16 => {
+            fused_single_query_attn_kernel::launch::<half::f16, f32, R>(
+                &client,
+                cube_count,
+                cube_dim,
+                q.into_tensor_arg(),
+                k.into_tensor_arg(),
+                v.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                n_kv as u32,
+                d_k as u32,
+                n_stripes as u32,
+            );
+        }
+        _ => {
+            fused_single_query_attn_kernel::launch::<f32, f32, R>(
+                &client,
+                cube_count,
+                cube_dim,
+                q.into_tensor_arg(),
+                k.into_tensor_arg(),
+                v.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                n_kv as u32,
+                d_k as u32,
+                n_stripes as u32,
+            );
+        }
+    }
 
     output
 }

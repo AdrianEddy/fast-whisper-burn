@@ -15,7 +15,7 @@ fn save_whisper<B: CustomKernelsBackend>(
 
     let mut storef16 = BurnpackStore::from_file(&format!("{name}-f16.bpk"))
         .overwrite(true)
-        .with_to_adapter(MixedPrecisionAdapter);
+        .with_to_adapter(MixedPrecisionAdapter(burn::tensor::DType::F16));
     whisper.save_into(&mut storef16)
 }
 
