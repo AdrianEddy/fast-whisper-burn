@@ -18,7 +18,7 @@ use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElemen
 use cubecl::prelude::*;
 use cubecl::{CubeCount, CubeDim};
 
-const BLOCK_SIZE: u32 = 256;
+const BLOCK_SIZE: u32 = 128;
 const ATTN_D_K_MAX: u32 = 128; // Max d_k for shared memory in fused attention kernel
 const ATTN_N_STRIPES_MAX: u32 = 4; // Max number of parallel stripes for attention
 const ATTN_SMEM_PARTIALS: u32 = ATTN_N_STRIPES_MAX * ATTN_D_K_MAX; // partial_out shared mem
