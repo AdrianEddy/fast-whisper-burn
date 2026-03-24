@@ -15,7 +15,6 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
-use cubecl::frontend::ScalarArg;
 use cubecl::prelude::*;
 use cubecl::{CubeCount, CubeDim};
 
@@ -493,11 +492,11 @@ fn launch_layer_norm_f16<R: CubeRuntime>(
         &client,
         cube_count,
         cube_dim,
-        input.as_tensor_arg(1),
-        gamma.as_tensor_arg(1),
-        beta.as_tensor_arg(1),
-        output.clone().as_tensor_arg(1),
-        ScalarArg::new(d_model as u32),
+        input.into_tensor_arg(),
+        gamma.into_tensor_arg(),
+        beta.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        d_model as u32,
     );
 
     output
@@ -530,9 +529,9 @@ fn launch_softmax_f16<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
         &client,
         cube_count,
         cube_dim,
-        input.as_tensor_arg(1),
-        output.clone().as_tensor_arg(1),
-        ScalarArg::new(row_size as u32),
+        input.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        row_size as u32,
     );
 
     output
@@ -571,12 +570,12 @@ fn launch_linear_f16<R: CubeRuntime>(
         &client,
         cube_count,
         cube_dim,
-        input.as_tensor_arg(1),
-        weight.as_tensor_arg(1),
-        bias.as_tensor_arg(1),
-        output.clone().as_tensor_arg(1),
-        ScalarArg::new(d_in as u32),
-        ScalarArg::new(d_out as u32),
+        input.into_tensor_arg(),
+        weight.into_tensor_arg(),
+        bias.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        d_in as u32,
+        d_out as u32,
     );
 
     output
@@ -617,13 +616,13 @@ fn launch_lstm_cell_fused<R: CubeRuntime>(
         &client,
         cube_count,
         cube_dim,
-        hidden.as_tensor_arg(1),
-        cell.as_tensor_arg(1),
-        input_gates.as_tensor_arg(1),
-        weight.as_tensor_arg(1),
-        bias.as_tensor_arg(1),
-        output.clone().as_tensor_arg(1),
-        ScalarArg::new(d_hidden as u32),
+        hidden.into_tensor_arg(),
+        cell.into_tensor_arg(),
+        input_gates.into_tensor_arg(),
+        weight.into_tensor_arg(),
+        bias.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        d_hidden as u32,
     );
 
     output
@@ -670,13 +669,13 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
                 &client,
                 cube_count,
                 cube_dim,
-                q.as_tensor_arg(1),
-                k.as_tensor_arg(1),
-                v.as_tensor_arg(1),
-                output.clone().as_tensor_arg(1),
-                ScalarArg::new(n_kv as u32),
-                ScalarArg::new(d_k as u32),
-                ScalarArg::new(n_stripes as u32),
+                q.into_tensor_arg(),
+                k.into_tensor_arg(),
+                v.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                n_kv as u32,
+                d_k as u32,
+                n_stripes as u32,
             );
         }
         _ => {
@@ -684,13 +683,13 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
                 &client,
                 cube_count,
                 cube_dim,
-                q.as_tensor_arg(1),
-                k.as_tensor_arg(1),
-                v.as_tensor_arg(1),
-                output.clone().as_tensor_arg(1),
-                ScalarArg::new(n_kv as u32),
-                ScalarArg::new(d_k as u32),
-                ScalarArg::new(n_stripes as u32),
+                q.into_tensor_arg(),
+                k.into_tensor_arg(),
+                v.into_tensor_arg(),
+                output.clone().into_tensor_arg(),
+                n_kv as u32,
+                d_k as u32,
+                n_stripes as u32,
             );
         }
     }
