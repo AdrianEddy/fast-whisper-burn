@@ -8,6 +8,7 @@
 
 use burn::nn;
 use burn::tensor::backend::Backend;
+use burn::tensor::backend::BackendTypes;
 use burn::tensor::{Tensor as BurnTensor, TensorPrimitive};
 use burn_backend::DType;
 use burn_backend::TensorMetadata;
@@ -704,38 +705,38 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
 /// Backend extension for fused f16 mixed-precision kernels.
 pub trait CustomKernelsBackend: Backend {
     fn layer_norm_f16(
-        input: <Self as Backend>::FloatTensorPrimitive,
-        gamma: <Self as Backend>::FloatTensorPrimitive,
-        beta: <Self as Backend>::FloatTensorPrimitive,
-    ) -> <Self as Backend>::FloatTensorPrimitive;
+        input: <Self as BackendTypes>::FloatTensorPrimitive,
+        gamma: <Self as BackendTypes>::FloatTensorPrimitive,
+        beta: <Self as BackendTypes>::FloatTensorPrimitive,
+    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
 
     fn softmax_f16(
-        input: <Self as Backend>::FloatTensorPrimitive,
-    ) -> <Self as Backend>::FloatTensorPrimitive;
+        input: <Self as BackendTypes>::FloatTensorPrimitive,
+    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
 
     fn linear_f16(
-        input: <Self as Backend>::FloatTensorPrimitive,
-        weight: <Self as Backend>::FloatTensorPrimitive,
-        bias: <Self as Backend>::FloatTensorPrimitive,
-    ) -> <Self as Backend>::FloatTensorPrimitive;
+        input: <Self as BackendTypes>::FloatTensorPrimitive,
+        weight: <Self as BackendTypes>::FloatTensorPrimitive,
+        bias: <Self as BackendTypes>::FloatTensorPrimitive,
+    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
 
     /// Fused LSTM cell: combines matmul + gate activations + cell/hidden update.
     /// Returns packed [new_hidden | new_cell] tensor of shape [2 * d_hidden].
     fn lstm_cell_fused(
-        hidden: <Self as Backend>::FloatTensorPrimitive,
-        cell: <Self as Backend>::FloatTensorPrimitive,
-        input_gates: <Self as Backend>::FloatTensorPrimitive,
-        weight: <Self as Backend>::FloatTensorPrimitive,
-        bias: <Self as Backend>::FloatTensorPrimitive,
-    ) -> <Self as Backend>::FloatTensorPrimitive;
+        hidden: <Self as BackendTypes>::FloatTensorPrimitive,
+        cell: <Self as BackendTypes>::FloatTensorPrimitive,
+        input_gates: <Self as BackendTypes>::FloatTensorPrimitive,
+        weight: <Self as BackendTypes>::FloatTensorPrimitive,
+        bias: <Self as BackendTypes>::FloatTensorPrimitive,
+    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
 
     /// Fused single-query attention: Q@K^T·scale → softmax → @V in one kernel.
     /// All inputs are 4D [batch, n_heads, seq/n_kv, d_k]. Q has seq=1.
     fn fused_single_query_attn(
-        q: <Self as Backend>::FloatTensorPrimitive,
-        k: <Self as Backend>::FloatTensorPrimitive,
-        v: <Self as Backend>::FloatTensorPrimitive,
-    ) -> <Self as Backend>::FloatTensorPrimitive;
+        q: <Self as BackendTypes>::FloatTensorPrimitive,
+        k: <Self as BackendTypes>::FloatTensorPrimitive,
+        v: <Self as BackendTypes>::FloatTensorPrimitive,
+    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
 }
 
 // Impl for CubeBackend (non-fusion)
@@ -801,10 +802,10 @@ mod fusion_impl {
         B: FusionBackend + CustomKernelsBackend,
     {
         fn layer_norm_f16(
-            input: <Self as Backend>::FloatTensorPrimitive,
-            gamma: <Self as Backend>::FloatTensorPrimitive,
-            beta: <Self as Backend>::FloatTensorPrimitive,
-        ) -> <Self as Backend>::FloatTensorPrimitive {
+            input: <Self as BackendTypes>::FloatTensorPrimitive,
+            gamma: <Self as BackendTypes>::FloatTensorPrimitive,
+            beta: <Self as BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
             let client = input.client.clone();
             let out_shape = input.shape.clone();
             let out_dtype = input.dtype;
@@ -853,8 +854,8 @@ mod fusion_impl {
         }
 
         fn softmax_f16(
-            input: <Self as Backend>::FloatTensorPrimitive,
-        ) -> <Self as Backend>::FloatTensorPrimitive {
+            input: <Self as BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
             let client = input.client.clone();
             let out_shape = input.shape.clone();
             let out_dtype = input.dtype;
@@ -897,10 +898,10 @@ mod fusion_impl {
         }
 
         fn linear_f16(
-            input: <Self as Backend>::FloatTensorPrimitive,
-            weight: <Self as Backend>::FloatTensorPrimitive,
-            bias: <Self as Backend>::FloatTensorPrimitive,
-        ) -> <Self as Backend>::FloatTensorPrimitive {
+            input: <Self as BackendTypes>::FloatTensorPrimitive,
+            weight: <Self as BackendTypes>::FloatTensorPrimitive,
+            bias: <Self as BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
             let client = input.client.clone();
             let out_dtype = input.dtype;
 
@@ -953,12 +954,12 @@ mod fusion_impl {
         }
 
         fn lstm_cell_fused(
-            hidden: <Self as Backend>::FloatTensorPrimitive,
-            cell: <Self as Backend>::FloatTensorPrimitive,
-            input_gates: <Self as Backend>::FloatTensorPrimitive,
-            weight: <Self as Backend>::FloatTensorPrimitive,
-            bias: <Self as Backend>::FloatTensorPrimitive,
-        ) -> <Self as Backend>::FloatTensorPrimitive {
+            hidden: <Self as BackendTypes>::FloatTensorPrimitive,
+            cell: <Self as BackendTypes>::FloatTensorPrimitive,
+            input_gates: <Self as BackendTypes>::FloatTensorPrimitive,
+            weight: <Self as BackendTypes>::FloatTensorPrimitive,
+            bias: <Self as BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
             let client = hidden.client.clone();
             let out_dtype = hidden.dtype;
             let d_hidden: usize = hidden.shape.iter().product();
@@ -1018,10 +1019,10 @@ mod fusion_impl {
         }
 
         fn fused_single_query_attn(
-            q: <Self as Backend>::FloatTensorPrimitive,
-            k: <Self as Backend>::FloatTensorPrimitive,
-            v: <Self as Backend>::FloatTensorPrimitive,
-        ) -> <Self as Backend>::FloatTensorPrimitive {
+            q: <Self as BackendTypes>::FloatTensorPrimitive,
+            k: <Self as BackendTypes>::FloatTensorPrimitive,
+            v: <Self as BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
             let client = q.client.clone();
             let out_shape = q.shape.clone();
             let out_dtype = q.dtype;

@@ -13,6 +13,7 @@ use burn::config::Config;
 use burn_store::ModuleSnapshot;
 use hound::{self, SampleFormat};
 use std::{env, fs, io::Write, path::Path, process, time::Instant};
+//use simplelog::*;
 
 type WgpuF32 = burn::backend::Wgpu<f32>;
 
@@ -100,8 +101,9 @@ fn segments_to_text(segments: &[TranscriptSegment]) -> String {
 }
 
 fn main() {
+    //let _ = SimpleLogger::init(LevelFilter::Debug, Default::default());
     let total_started = Instant::now();
-    let tensor_device = <WgpuF32 as burn::tensor::backend::Backend>::Device::default();
+    let tensor_device = burn::backend::wgpu::WgpuDevice::default();
 
     let args: Vec<String> = env::args().collect();
     let use_f16 = args.iter().any(|a| a == "--f16");
@@ -121,10 +123,11 @@ fn main() {
         process::exit(1);
     }
 
+    let model_name = pos_args[1];
     let wav_file = pos_args[2];
+    let lang_str = pos_args[3];
     let text_file = pos_args[4];
 
-    let lang_str = pos_args[3];
     let lang = if lang_str == "auto" || Language::iter().any(|lang| lang.as_str() == lang_str) {
         lang_str
     } else {
@@ -132,7 +135,6 @@ fn main() {
         process::exit(1);
     };
 
-    let model_name = pos_args[1];
 
     println!("Loading waveform...");
     let waveform_started = Instant::now();

@@ -7,12 +7,11 @@ use crate::model::*;
 use crate::token::{self, *};
 use burn::tensor::TensorData;
 use burn::{
-    backend::ndarray::NdArray,
+    backend::flex::*,
     module::Module,
     tensor::{
         ElementConversion, Int, Tensor,
         activation::{log_softmax, softmax},
-        backend::Backend,
     },
 };
 use mt19937::MT19937;
@@ -22,7 +21,7 @@ use std::{
     io::{Error as IoError, ErrorKind},
 };
 
-/// Compute mel spectrogram on CPU (NdArray backend) to avoid GPU kernel launch
+/// Compute mel spectrogram on CPU (Flex backend) to avoid GPU kernel launch
 /// overhead for the many small STFT operations, then upload to the target device.
 fn compute_mel_cpu<B: CustomKernelsBackend>(
     waveform: &[f32],
@@ -30,9 +29,9 @@ fn compute_mel_cpu<B: CustomKernelsBackend>(
     n_mels: usize,
     device: &B::Device,
 ) -> Tensor<B, 3> {
-    let cpu_device = <NdArray as Backend>::Device::default();
-    let wav: Tensor<NdArray, 1> = Tensor::from_floats(waveform, &cpu_device);
-    let mel: Tensor<NdArray, 3> = prep_audio(wav.unsqueeze(), sample_rate as f64, n_mels);
+    let cpu_device = FlexDevice::default();
+    let wav: Tensor<Flex, 1> = Tensor::from_floats(waveform, &cpu_device);
+    let mel: Tensor<Flex, 3> = prep_audio(wav.unsqueeze(), sample_rate as f64, n_mels);
     Tensor::<B, 3>::from_data(mel.into_data(), device)
 }
 

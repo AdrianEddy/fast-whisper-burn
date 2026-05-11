@@ -4,18 +4,26 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn         = { git = "https://github.com/tracel-ai/burn.git",   rev = "9deccba", features = ["wgpu", "autotune", "fusion", "ndarray"] }
-burn-store   = { git = "https://github.com/tracel-ai/burn.git",   rev = "9deccba", features = ["burnpack", "pytorch"] }
-burn-cubecl  = { git = "https://github.com/tracel-ai/burn.git",   rev = "9deccba" }
-burn-fusion  = { git = "https://github.com/tracel-ai/burn.git",   rev = "9deccba" }
-burn-ir      = { git = "https://github.com/tracel-ai/burn.git",   rev = "9deccba" }
-burn-backend = { git = "https://github.com/tracel-ai/burn.git",   rev = "9deccba" }
-cubecl       = { git = "https://github.com/tracel-ai/cubecl.git", rev = "83b0ba08111276bc0b9064f6b1d25923639aaccf", features = ["stdlib"] }
+#burn         = { version = "0.21", features = ["vulkan", "autotune", "fusion", "flex"] }
+#burn-store   = { version = "0.21", features = ["burnpack", "pytorch"] }
+#burn-cubecl  = { version = "0.21" }
+#burn-fusion  = { version = "0.21" }
+#burn-ir      = { version = "0.21" }
+#burn-backend = { version = "0.21" }
+#cubecl       = { version = "0.10.0", features = ["stdlib"] }
+burn         = { git = "https://github.com/AdrianEddy/burn", features = ["wgpu", "autotune", "fusion", "flex"] }
+burn-store   = { git = "https://github.com/AdrianEddy/burn", features = ["burnpack", "pytorch"] }
+burn-cubecl  = { git = "https://github.com/AdrianEddy/burn" }
+burn-fusion  = { git = "https://github.com/AdrianEddy/burn" }
+burn-ir      = { git = "https://github.com/AdrianEddy/burn" }
+burn-backend = { git = "https://github.com/AdrianEddy/burn" }
+cubecl       = { git = "https://github.com/tracel-ai/cubecl", rev = "901d37dbd4a916b764360e4fea111b01356f8263", features = ["stdlib"] }
 half = "2"
 serde = { version = "1.0", features = ["std", "derive"] }
 hound = "3.5.1"
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 strum = "0.28.0"
 strum_macros = "0.28.0"
 log = "0.4"
 mt19937 = "3.3.0"
+simplelog = "0.12"
