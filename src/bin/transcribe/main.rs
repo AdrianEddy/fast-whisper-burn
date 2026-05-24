@@ -1,5 +1,4 @@
-use fast_whisper_burn::MixedPrecisionAdapter;
-use fast_whisper_burn::custom_kernels::CustomKernelsBackend;
+﻿use fast_whisper_burn::MixedPrecisionAdapter;
 use fast_whisper_burn::model::*;
 use fast_whisper_burn::token::{Gpt2Tokenizer, Language};
 use fast_whisper_burn::transcribe::{
@@ -10,12 +9,11 @@ use fast_whisper_burn::vad::*;
 use strum::IntoEnumIterator;
 
 use burn::config::Config;
+use burn::tensor::Device;
 use burn_store::ModuleSnapshot;
 use hound::{self, SampleFormat};
 use std::{env, fs, io::Write, path::Path, process, time::Instant};
 // use simplelog::*;
-
-type WgpuF32 = burn::backend::Wgpu<f32>;
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 
@@ -103,7 +101,7 @@ fn segments_to_text(segments: &[TranscriptSegment]) -> String {
 fn main() {
     //let _ = SimpleLogger::init(LevelFilter::Debug, Default::default());
     let total_started = Instant::now();
-    let tensor_device = burn::backend::wgpu::WgpuDevice::default();
+    let tensor_device = Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
 
     let args: Vec<String> = env::args().collect();
     let use_f16 = args.iter().any(|a| a == "--f16");
@@ -155,7 +153,7 @@ fn main() {
 
     let use_beam_search = !use_greedy;
 
-    run_transcription::<WgpuF32>(
+    run_transcription(
         &tensor_device,
         model_name,
         &waveform,
@@ -169,8 +167,8 @@ fn main() {
     );
 }
 
-fn run_transcription<B: CustomKernelsBackend>(
-    tensor_device: &B::Device,
+fn run_transcription(
+    tensor_device: &Device,
     model_name: &str,
     waveform: &[f32],
     sample_rate: usize,
@@ -182,18 +180,19 @@ fn run_transcription<B: CustomKernelsBackend>(
     total_started: Instant,
 ) {
     let model_started = Instant::now();
-    let (bpe, _whisper_config, whisper) = load_model::<B>(model_name, tensor_device, use_f16);
+
+    let (bpe, _whisper_config, whisper) = load_model(model_name, tensor_device, use_f16);
     println!("Model loaded in {:.2?}", model_started.elapsed());
 
     let vad_started = Instant::now();
-    let vad = match SileroVAD6Model::<B>::new(tensor_device, false) {
+
+    let vad = match SileroVAD6Model::new(tensor_device, false) {
         Ok(vad) => vad,
         Err(e) => {
             eprintln!("Failed to initialize Silero VAD: {e}");
             process::exit(1);
         }
     };
-
     let speech_regions = match detect_speech_regions(
         &vad,
         tensor_device,
@@ -379,11 +378,11 @@ fn run_transcription<B: CustomKernelsBackend>(
     println!("Total elapsed: {:.2?}", total_started.elapsed());
 }
 
-fn load_model<B: CustomKernelsBackend>(
+fn load_model(
     model_name: &str,
-    tensor_device_ref: &B::Device,
+    tensor_device_ref: &Device,
     use_f16: bool,
-) -> (Gpt2Tokenizer, WhisperConfig, Whisper<B>) {
+) -> (Gpt2Tokenizer, WhisperConfig, Whisper) {
     let bpe = match Gpt2Tokenizer::new(&format!("models/{model_name}-tokenizer.json")) {
         Ok(bpe) => bpe,
         Err(e) => {
@@ -406,7 +405,7 @@ fn load_model<B: CustomKernelsBackend>(
         format!("models/{model_name}.bpk")
     };
     println!("Loading model from {bpk_path}...");
-    let whisper: Whisper<B> = {
+    let whisper: Whisper = {
         let mut store = burn_store::BurnpackStore::from_file(&bpk_path);
         let target_dtype = if use_f16 {
             // Mixed precision: cast most weights to f16, keep LayerNorm/embeddings in f32

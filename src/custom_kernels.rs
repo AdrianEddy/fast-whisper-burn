@@ -1,4 +1,4 @@
-//! Fused GPU kernels for mixed f16/f32 precision.
+﻿//! Fused GPU kernels for mixed f16/f32 precision.
 //!
 //! Contains CubeCL kernels for:
 //! - LayerNorm: reads f16, computes in f32, writes f16
@@ -6,10 +6,9 @@
 //! - Linear (matvec): reads f16 input + f32 weights, computes in f32, writes f16
 //! - Single-query attention: fused Q@K^T·scale→softmax→@V for seq_len=1 decoding
 
+use burn::backend::{Dispatch, Wgpu, backend_extension};
 use burn::nn;
-use burn::tensor::backend::Backend;
-use burn::tensor::backend::BackendTypes;
-use burn::tensor::{Tensor as BurnTensor, TensorPrimitive};
+use burn::tensor::Tensor as BurnTensor;
 use burn_backend::DType;
 use burn_backend::TensorMetadata;
 use burn_cubecl::kernel::into_contiguous;
@@ -703,43 +702,42 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
 // ===========================================================================
 
 /// Backend extension for fused f16 mixed-precision kernels.
-pub trait CustomKernelsBackend: Backend {
+#[backend_extension(Wgpu)]
+pub trait CustomKernelsBackend: burn::backend::Backend {
     fn layer_norm_f16(
-        input: <Self as BackendTypes>::FloatTensorPrimitive,
-        gamma: <Self as BackendTypes>::FloatTensorPrimitive,
-        beta: <Self as BackendTypes>::FloatTensorPrimitive,
-    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
+        input: FloatTensor<Self>,
+        gamma: FloatTensor<Self>,
+        beta: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
 
-    fn softmax_f16(
-        input: <Self as BackendTypes>::FloatTensorPrimitive,
-    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
+    fn softmax_f16(input: FloatTensor<Self>) -> FloatTensor<Self>;
 
     fn linear_f16(
-        input: <Self as BackendTypes>::FloatTensorPrimitive,
-        weight: <Self as BackendTypes>::FloatTensorPrimitive,
-        bias: <Self as BackendTypes>::FloatTensorPrimitive,
-    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
+        input: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
 
     /// Fused LSTM cell: combines matmul + gate activations + cell/hidden update.
     /// Returns packed [new_hidden | new_cell] tensor of shape [2 * d_hidden].
     fn lstm_cell_fused(
-        hidden: <Self as BackendTypes>::FloatTensorPrimitive,
-        cell: <Self as BackendTypes>::FloatTensorPrimitive,
-        input_gates: <Self as BackendTypes>::FloatTensorPrimitive,
-        weight: <Self as BackendTypes>::FloatTensorPrimitive,
-        bias: <Self as BackendTypes>::FloatTensorPrimitive,
-    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
+        hidden: FloatTensor<Self>,
+        cell: FloatTensor<Self>,
+        input_gates: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
 
     /// Fused single-query attention: Q@K^T·scale → softmax → @V in one kernel.
     /// All inputs are 4D [batch, n_heads, seq/n_kv, d_k]. Q has seq=1.
     fn fused_single_query_attn(
-        q: <Self as BackendTypes>::FloatTensorPrimitive,
-        k: <Self as BackendTypes>::FloatTensorPrimitive,
-        v: <Self as BackendTypes>::FloatTensorPrimitive,
-    ) -> <Self as BackendTypes>::FloatTensorPrimitive;
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
 }
 
-// Impl for CubeBackend (non-fusion)
+// Impl for CubeBackend (non-fusion). Wraps backends that are just CubeBackend without Fusion.
 impl<R, F, I, BT> CustomKernelsBackend for CubeBackend<R, F, I, BT>
 where
     R: CubeRuntime,
@@ -792,7 +790,7 @@ where
 
 mod fusion_impl {
     use super::*;
-    use burn_fusion::stream::{Operation, OperationStreams};
+    use burn_fusion::stream::{Operation, StreamId};
     use burn_fusion::{Fusion, FusionBackend, FusionRuntime};
     use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
     use std::marker::PhantomData;
@@ -802,10 +800,10 @@ mod fusion_impl {
         B: FusionBackend + CustomKernelsBackend,
     {
         fn layer_norm_f16(
-            input: <Self as BackendTypes>::FloatTensorPrimitive,
-            gamma: <Self as BackendTypes>::FloatTensorPrimitive,
-            beta: <Self as BackendTypes>::FloatTensorPrimitive,
-        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
+            input: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            gamma: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            beta: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as burn_backend::BackendTypes>::FloatTensorPrimitive {
             let client = input.client.clone();
             let out_shape = input.shape.clone();
             let out_dtype = input.dtype;
@@ -832,7 +830,7 @@ mod fusion_impl {
                 }
             }
 
-            let streams = OperationStreams::with_inputs([&input, &gamma, &beta]);
+            let streams = StreamId::current();
             let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
 
             let desc = CustomOpIr::new(
@@ -854,8 +852,8 @@ mod fusion_impl {
         }
 
         fn softmax_f16(
-            input: <Self as BackendTypes>::FloatTensorPrimitive,
-        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
+            input: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as burn_backend::BackendTypes>::FloatTensorPrimitive {
             let client = input.client.clone();
             let out_shape = input.shape.clone();
             let out_dtype = input.dtype;
@@ -880,7 +878,7 @@ mod fusion_impl {
                 }
             }
 
-            let streams = OperationStreams::with_inputs([&input]);
+            let streams = StreamId::current();
             let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
 
             let desc = CustomOpIr::new("softmax_f16", &[input.into_ir()], &[out_ir]);
@@ -898,10 +896,10 @@ mod fusion_impl {
         }
 
         fn linear_f16(
-            input: <Self as BackendTypes>::FloatTensorPrimitive,
-            weight: <Self as BackendTypes>::FloatTensorPrimitive,
-            bias: <Self as BackendTypes>::FloatTensorPrimitive,
-        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
+            input: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            weight: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            bias: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as burn_backend::BackendTypes>::FloatTensorPrimitive {
             let client = input.client.clone();
             let out_dtype = input.dtype;
 
@@ -932,7 +930,7 @@ mod fusion_impl {
                 }
             }
 
-            let streams = OperationStreams::with_inputs([&input, &weight, &bias]);
+            let streams = StreamId::current();
             let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
 
             let desc = CustomOpIr::new(
@@ -954,12 +952,12 @@ mod fusion_impl {
         }
 
         fn lstm_cell_fused(
-            hidden: <Self as BackendTypes>::FloatTensorPrimitive,
-            cell: <Self as BackendTypes>::FloatTensorPrimitive,
-            input_gates: <Self as BackendTypes>::FloatTensorPrimitive,
-            weight: <Self as BackendTypes>::FloatTensorPrimitive,
-            bias: <Self as BackendTypes>::FloatTensorPrimitive,
-        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
+            hidden: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            cell: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            input_gates: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            weight: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            bias: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as burn_backend::BackendTypes>::FloatTensorPrimitive {
             let client = hidden.client.clone();
             let out_dtype = hidden.dtype;
             let d_hidden: usize = hidden.shape.iter().product();
@@ -990,8 +988,7 @@ mod fusion_impl {
                 }
             }
 
-            let streams =
-                OperationStreams::with_inputs([&hidden, &cell, &input_gates, &weight, &bias]);
+            let streams = StreamId::current();
             let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
 
             let desc = CustomOpIr::new(
@@ -1019,10 +1016,10 @@ mod fusion_impl {
         }
 
         fn fused_single_query_attn(
-            q: <Self as BackendTypes>::FloatTensorPrimitive,
-            k: <Self as BackendTypes>::FloatTensorPrimitive,
-            v: <Self as BackendTypes>::FloatTensorPrimitive,
-        ) -> <Self as BackendTypes>::FloatTensorPrimitive {
+            q: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            k: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            v: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as burn_backend::BackendTypes>::FloatTensorPrimitive {
             let client = q.client.clone();
             let out_shape = q.shape.clone();
             let out_dtype = q.dtype;
@@ -1049,7 +1046,7 @@ mod fusion_impl {
                 }
             }
 
-            let streams = OperationStreams::with_inputs([&q, &k, &v]);
+            let streams = StreamId::current();
             let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
 
             let desc = CustomOpIr::new(
@@ -1073,32 +1070,32 @@ mod fusion_impl {
 }
 
 // ===========================================================================
-// Public high-level helpers
+// Public high-level helpers (dispatched via the global `Dispatch` backend)
 // ===========================================================================
 
 /// Fused LayerNorm for f16 tensors: reads f16, computes in f32, writes f16.
-pub fn layer_norm_f16<B: CustomKernelsBackend, const D: usize>(
-    input: BurnTensor<B, D>,
-    gamma: BurnTensor<B, 1>,
-    beta: BurnTensor<B, 1>,
-) -> BurnTensor<B, D> {
-    let output = B::layer_norm_f16(
-        input.into_primitive().tensor(),
-        gamma.into_primitive().tensor(),
-        beta.into_primitive().tensor(),
+pub fn layer_norm_f16<const D: usize>(
+    input: BurnTensor<D>,
+    gamma: BurnTensor<1>,
+    beta: BurnTensor<1>,
+) -> BurnTensor<D> {
+    let output = Dispatch::layer_norm_f16(
+        input.into_primitive(),
+        gamma.into_primitive(),
+        beta.into_primitive(),
     );
-    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+    BurnTensor::from_primitive(output)
 }
 
 /// Convenience: run LayerNorm, choosing the fused f16 kernel when `use_f16` is
 /// true and falling back to the standard burn `nn::LayerNorm` otherwise.
-pub fn layer_norm_mixed<B: CustomKernelsBackend, const D: usize>(
-    ln: &nn::LayerNorm<B>,
-    x: BurnTensor<B, D>,
+pub fn layer_norm_mixed<const D: usize>(
+    ln: &nn::LayerNorm,
+    x: BurnTensor<D>,
     use_f16: bool,
-) -> BurnTensor<B, D> {
+) -> BurnTensor<D> {
     if use_f16 {
-        layer_norm_f16::<B, D>(
+        layer_norm_f16::<D>(
             x,
             ln.gamma.val(),
             ln.beta
@@ -1113,27 +1110,21 @@ pub fn layer_norm_mixed<B: CustomKernelsBackend, const D: usize>(
 
 /// Fused Softmax for f16 tensors: reads f16, computes in f32, writes f16.
 /// Always operates on the last dimension.
-pub fn softmax_f16<B: CustomKernelsBackend, const D: usize>(
-    input: BurnTensor<B, D>,
-) -> BurnTensor<B, D> {
-    let output = B::softmax_f16(input.into_primitive().tensor());
-    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+pub fn softmax_f16<const D: usize>(input: BurnTensor<D>) -> BurnTensor<D> {
+    let output = Dispatch::softmax_f16(input.into_primitive());
+    BurnTensor::from_primitive(output)
 }
 
 /// Convenience: run softmax, choosing the fused f16 kernel when `use_f16` is
 /// true and falling back to `burn::tensor::activation::softmax` otherwise.
-pub fn softmax_mixed<B: CustomKernelsBackend, const D: usize>(
-    x: BurnTensor<B, D>,
-    dim: usize,
-    use_f16: bool,
-) -> BurnTensor<B, D> {
+pub fn softmax_mixed<const D: usize>(x: BurnTensor<D>, dim: usize, use_f16: bool) -> BurnTensor<D> {
     if use_f16 {
         assert_eq!(
             dim,
             D - 1,
             "Fused f16 softmax only supports the last dimension"
         );
-        softmax_f16::<B, D>(x)
+        softmax_f16::<D>(x)
     } else {
         burn::tensor::activation::softmax(x, dim)
     }
@@ -1141,33 +1132,29 @@ pub fn softmax_mixed<B: CustomKernelsBackend, const D: usize>(
 
 /// Fused Linear for f16 I/O: reads f16 input + f32 weight/bias, computes in f32, writes f16.
 /// Equivalent to `cast(F32) -> Linear -> cast(F16)` but in a single kernel dispatch.
-pub fn linear_f16<B: CustomKernelsBackend, const D: usize>(
-    input: BurnTensor<B, D>,
-    weight: BurnTensor<B, 2>,
-    bias: Option<BurnTensor<B, 1>>,
-) -> BurnTensor<B, D> {
+pub fn linear_f16<const D: usize>(
+    input: BurnTensor<D>,
+    weight: BurnTensor<2>,
+    bias: Option<BurnTensor<1>>,
+) -> BurnTensor<D> {
     let device = input.device();
     let d_out = weight.dims()[0];
-    let bias = bias.unwrap_or_else(|| BurnTensor::zeros([d_out], &device));
-    let output = B::linear_f16(
-        input.into_primitive().tensor(),
-        weight.into_primitive().tensor(),
-        bias.into_primitive().tensor(),
+    let bias = bias.unwrap_or_else(|| BurnTensor::<1>::zeros([d_out], &device));
+    let output = Dispatch::linear_f16(
+        input.into_primitive(),
+        weight.into_primitive(),
+        bias.into_primitive(),
     );
-    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+    BurnTensor::from_primitive(output)
 }
 
 /// Convenience: run Linear, choosing the fused f16 kernel when `use_f16` is
 /// true and falling back to `nn::Linear::forward` otherwise.
-pub fn linear_mixed<B: CustomKernelsBackend, const D: usize>(
-    linear: &nn::Linear<B>,
-    x: BurnTensor<B, D>,
-    use_f16: bool,
-) -> BurnTensor<B, D> {
+pub fn linear_mixed<const D: usize>(linear: &nn::Linear, x: BurnTensor<D>, use_f16: bool) -> BurnTensor<D> {
     if use_f16 {
         let weight = linear.weight.val();
-        let bias: Option<BurnTensor<B, 1>> = linear.bias.as_ref().map(|b| b.val());
-        linear_f16::<B, D>(x, weight, bias)
+        let bias: Option<BurnTensor<1>> = linear.bias.as_ref().map(|b| b.val());
+        linear_f16::<D>(x, weight, bias)
     } else {
         linear.forward(x)
     }
@@ -1175,22 +1162,22 @@ pub fn linear_mixed<B: CustomKernelsBackend, const D: usize>(
 
 /// Fused LSTM cell step: matmul + gate activations + cell/hidden update in a single kernel.
 /// Returns (new_hidden [1, d_hidden], new_cell [1, d_hidden]).
-pub fn lstm_cell_fused<B: CustomKernelsBackend>(
-    hidden: BurnTensor<B, 2>,      // [1, d_hidden]
-    cell: BurnTensor<B, 2>,        // [1, d_hidden]
-    input_gates: BurnTensor<B, 2>, // [1, 4*d_hidden]
-    weight: BurnTensor<B, 2>,      // [4*d_hidden, d_hidden]
-    bias: BurnTensor<B, 1>,        // [4*d_hidden]
-) -> (BurnTensor<B, 2>, BurnTensor<B, 2>) {
+pub fn lstm_cell_fused(
+    hidden: BurnTensor<2>,      // [1, d_hidden]
+    cell: BurnTensor<2>,        // [1, d_hidden]
+    input_gates: BurnTensor<2>, // [1, 4*d_hidden]
+    weight: BurnTensor<2>,      // [4*d_hidden, d_hidden]
+    bias: BurnTensor<1>,        // [4*d_hidden]
+) -> (BurnTensor<2>, BurnTensor<2>) {
     let d_hidden = hidden.dims()[1];
-    let output = B::lstm_cell_fused(
-        hidden.flatten::<1>(0, 1).into_primitive().tensor(),
-        cell.flatten::<1>(0, 1).into_primitive().tensor(),
-        input_gates.flatten::<1>(0, 1).into_primitive().tensor(),
-        weight.into_primitive().tensor(),
-        bias.into_primitive().tensor(),
+    let output = Dispatch::lstm_cell_fused(
+        hidden.flatten::<1>(0, 1).into_primitive(),
+        cell.flatten::<1>(0, 1).into_primitive(),
+        input_gates.flatten::<1>(0, 1).into_primitive(),
+        weight.into_primitive(),
+        bias.into_primitive(),
     );
-    let combined: BurnTensor<B, 1> = BurnTensor::from_primitive(TensorPrimitive::Float(output));
+    let combined: BurnTensor<1> = BurnTensor::from_primitive(output);
     let new_hidden = combined.clone().slice([0..d_hidden]).reshape([1, d_hidden]);
     let new_cell = combined
         .slice([d_hidden..2 * d_hidden])
@@ -1202,15 +1189,12 @@ pub fn lstm_cell_fused<B: CustomKernelsBackend>(
 /// Computes Q@K^T·scale → softmax → @V in a single kernel (no intermediate tensors).
 /// Q: [batch, n_heads, 1, d_k], K/V: [batch, n_heads, n_kv, d_k].
 /// Returns context: [batch, n_heads, 1, d_k].
-pub fn fused_single_query_attn<B: CustomKernelsBackend>(
-    q: BurnTensor<B, 4>,
-    k: BurnTensor<B, 4>,
-    v: BurnTensor<B, 4>,
-) -> BurnTensor<B, 4> {
-    let output = B::fused_single_query_attn(
-        q.into_primitive().tensor(),
-        k.into_primitive().tensor(),
-        v.into_primitive().tensor(),
+pub fn fused_single_query_attn(q: BurnTensor<4>, k: BurnTensor<4>, v: BurnTensor<4>) -> BurnTensor<4> {
+    let output = Dispatch::fused_single_query_attn(
+        q.into_primitive(),
+        k.into_primitive(),
+        v.into_primitive(),
     );
-    BurnTensor::from_primitive(TensorPrimitive::Float(output))
+    BurnTensor::from_primitive(output)
 }
+

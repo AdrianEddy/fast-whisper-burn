@@ -1,12 +1,11 @@
-use crate::custom_kernels::CustomKernelsBackend;
-use crate::model::*;
+﻿use crate::model::*;
 use crate::transcribe::{
     CHUNK_SIZE, SamplingStrategy, SegmentDecodeResult, WhisperParams,
     average_cross_attention_for_token, compute_entropy, sequence_score,
 };
 use burn::tensor::TensorData;
 use burn::tensor::{
-    ElementConversion, Int, Tensor,
+    Device, ElementConversion, Int, Tensor,
     activation::{log_softmax, softmax},
 };
 use std::f32;
@@ -26,8 +25,8 @@ struct BeamSequence {
 }
 
 #[derive(Clone)]
-struct BeamDecoder<B: CustomKernelsBackend> {
-    pending_logits: Tensor<B, 1>,
+struct BeamDecoder {
+    pending_logits: Tensor<1>,
     pending_attention: Vec<f32>,
     full_tokens: Vec<usize>,
     sequence: BeamSequence,
@@ -95,9 +94,9 @@ pub(crate) fn decoder_count_for_iteration(params: &WhisperParams, temperature: f
     count.max(1)
 }
 
-pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
-    whisper: &Whisper<B>,
-    encoder_output: &Tensor<B, 3>,
+pub(crate) fn decode_segment_beam(
+    whisper: &Whisper,
+    encoder_output: &Tensor<3>,
     prompt: &[usize],
     temperature: f32,
     n_max: usize,
@@ -114,7 +113,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
     delta_min: usize,
     n_audio_ctx: usize,
     beam_size: usize,
-    device: &B::Device,
+    device: &Device,
 ) -> SegmentDecodeResult {
     let mut no_speech_prob = 0.0f32;
     let fused_weights = if params.use_f16_compute {
@@ -146,7 +145,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
     } else {
         Vec::new()
     };
-    let prompt_logits: Tensor<B, 1> = prompt_output
+    let prompt_logits: Tensor<1> = prompt_output
         .logits
         .slice([0..1, prompt_last_pos..prompt_last_pos + 1])
         .flatten::<1>(0, 2);
@@ -156,7 +155,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
     if token_nosp < prob_size {
         no_speech_prob = probs
             .slice([token_nosp..token_nosp + 1])
-            .into_scalar()
+            .into_scalar::<f32>()
             .elem();
     }
 
@@ -168,7 +167,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
             .collect(),
     );
 
-    let mut decoders: Vec<BeamDecoder<B>> = (0..beam_size)
+    let mut decoders: Vec<BeamDecoder> = (0..beam_size)
         .map(|_| BeamDecoder {
             pending_logits: prompt_logits.clone(),
             pending_attention: prompt_attention.clone(),
@@ -203,7 +202,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
             }
         })
         .collect();
-    let gpu_static_suppress: Tensor<B, 1> =
+    let gpu_static_suppress: Tensor<1> =
         Tensor::from_floats(static_suppress_data.as_slice(), device);
     let blank_suppress_data: Vec<f32> = (0..vocab_size)
         .map(|id| {
@@ -214,9 +213,9 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
             }
         })
         .collect();
-    let gpu_blank_suppress: Tensor<B, 1> =
+    let gpu_blank_suppress: Tensor<1> =
         Tensor::from_floats(blank_suppress_data.as_slice(), device);
-    let gpu_indices: Tensor<B, 1, Int> = Tensor::arange(0..vocab_size as i64, device);
+    let gpu_indices: Tensor<1, Int> = Tensor::arange(0..vocab_size as i64, device);
 
     for step in 0..n_max {
         let mut candidates_per_decoder: Vec<Vec<BeamCandidate>> = vec![Vec::new(); beam_size];
@@ -438,7 +437,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
         }
 
         // Reorder the persistent batched cache based on beam selection
-        let indices_tensor: Tensor<B, 1, Int> =
+        let indices_tensor: Tensor<1, Int> =
             Tensor::from_ints(TensorData::new(reorder_indices, [beam_size]), device);
 
         decoders = next_decoders;
@@ -524,7 +523,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
                 }
             })
             .collect();
-        let batched_tokens: Tensor<B, 2, Int> =
+        let batched_tokens: Tensor<2, Int> =
             Tensor::from_ints(TensorData::new(token_ids, [beam_size, 1]), device);
 
         let batched_output = if let Some(ref fused) = fused_weights {
@@ -547,7 +546,7 @@ pub(crate) fn decode_segment_beam<B: CustomKernelsBackend>(
             }
 
             let attention = if params.token_timestamps {
-                let beam_attn: Vec<Tensor<B, 4>> = batched_output
+                let beam_attn: Vec<Tensor<4>> = batched_output
                     .cross_attention_weights
                     .iter()
                     .map(|w| w.clone().slice([decoder_idx..decoder_idx + 1]))
@@ -645,3 +644,4 @@ fn decoded_tokens_equal(a: &[(usize, f64, usize)], b: &[(usize, f64, usize)]) ->
 
     true
 }
+

@@ -1,4 +1,4 @@
-mod silero_vad_op18_ifless;
+﻿mod silero_vad_op18_ifless;
 
 mod util;
 pub use util::*;
@@ -7,21 +7,21 @@ use burn::{prelude::*, tensor::ops::PadMode};
 use burn_store::{ModuleSnapshot, ModuleStore};
 use silero_vad_op18_ifless::Model as SileroModel;
 
-pub struct PredictState<B: Backend> {
+pub struct PredictState {
     pub context_size: usize,
-    pub context: Tensor<B, 2>,
-    pub state: Tensor<B, 3>,
+    pub context: Tensor<2>,
+    pub state: Tensor<3>,
 }
 
 /// The chunk size for processing audio_16k samples
 pub const CHUNK_SIZE: usize = 512;
 
-impl<B: Backend> PredictState<B> {
+impl PredictState {
     /// Create a new PredictState with given batch size and context size
     /// # Arguments
     /// * `context_size` - The size of the context window, which last chunk retains
     /// * `batch_size` - The number of samples processed in parallel, default is 1
-    pub fn new(device: &Device<B>, batch_size: usize, context_size: usize) -> Self {
+    pub fn new(device: &Device, batch_size: usize, context_size: usize) -> Self {
         Self {
             context_size,
             context: Tensor::zeros([batch_size, context_size], device),
@@ -29,7 +29,7 @@ impl<B: Backend> PredictState<B> {
         }
     }
 
-    pub fn default(device: &Device<B>) -> Self {
+    pub fn default(device: &Device) -> Self {
         Self::new(device, 1, 64)
     }
 
@@ -37,13 +37,13 @@ impl<B: Backend> PredictState<B> {
         512
     }
 
-    pub fn init_state(device: &Device<B>, batch_size: usize) -> Tensor<B, 3> {
+    pub fn init_state(device: &Device, batch_size: usize) -> Tensor<3> {
         Tensor::zeros([2, batch_size, 128], device)
     }
 }
 
-pub struct SileroVAD6Model<B: Backend> {
-    pub model: SileroModel<B>,
+pub struct SileroVAD6Model {
+    pub model: SileroModel,
     pub use_f16: bool,
 }
 
@@ -52,14 +52,14 @@ pub enum SileroVAD6Error {
     InvalidInputSize { expected: usize, found: usize },
 }
 
-impl<B: crate::custom_kernels::CustomKernelsBackend> SileroVAD6Model<B> {
+impl SileroVAD6Model {
     pub const SILERO_VAD6_WEIGHTS: &[u8] = include_bytes!("silero_vad_op18_ifless.bpk");
 
     pub fn new(
-        device: &Device<B>,
+        device: &Device,
         use_f16: bool,
     ) -> Result<Self, <burn_store::BurnpackStore as ModuleStore>::Error> {
-        let mut model = SileroModel::<B>::new(device);
+        let mut model = SileroModel::new(device);
 
         let bytes = burn::tensor::Bytes::from_bytes_vec(Self::SILERO_VAD6_WEIGHTS.to_vec());
         let mut store = burn_store::BurnpackStore::from_bytes(Some(bytes));
@@ -75,9 +75,9 @@ impl<B: crate::custom_kernels::CustomKernelsBackend> SileroVAD6Model<B> {
     /// Forward pass for 16kHz audio input
     pub fn predict(
         &self,
-        predict_state: PredictState<B>,
-        mut input: Tensor<B, 2>,
-    ) -> Result<(PredictState<B>, Tensor<B, 2>), SileroVAD6Error> {
+        predict_state: PredictState,
+        mut input: Tensor<2>,
+    ) -> Result<(PredictState, Tensor<2>), SileroVAD6Error> {
         let input_size = predict_state.input_size();
         if input.shape()[1] > input_size {
             return Err(SileroVAD6Error::InvalidInputSize {
@@ -118,9 +118,9 @@ impl<B: crate::custom_kernels::CustomKernelsBackend> SileroVAD6Model<B> {
     /// The input shape is `[steps, chunk_size]` and the recurrent state is advanced one step at a time. Outputs are concatenated and returned as `[steps, 1]`.
     pub fn predict_sequence(
         &self,
-        predict_state: PredictState<B>,
-        mut input: Tensor<B, 2>,
-    ) -> Result<(PredictState<B>, Tensor<B, 2>), SileroVAD6Error> {
+        predict_state: PredictState,
+        mut input: Tensor<2>,
+    ) -> Result<(PredictState, Tensor<2>), SileroVAD6Error> {
         let input_size = predict_state.input_size();
         if input.shape()[1] > input_size {
             return Err(SileroVAD6Error::InvalidInputSize {
@@ -168,3 +168,4 @@ impl<B: crate::custom_kernels::CustomKernelsBackend> SileroVAD6Model<B> {
         ))
     }
 }
+

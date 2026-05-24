@@ -1,16 +1,14 @@
-use crate::audio::prep_audio;
+﻿use crate::audio::prep_audio;
 use crate::beam::{
     decode_segment_beam, decoder_count_for_iteration, effective_beam_size, effective_best_of,
 };
-use crate::custom_kernels::CustomKernelsBackend;
 use crate::model::*;
 use crate::token::{self, *};
 use burn::tensor::TensorData;
 use burn::{
-    backend::flex::*,
     module::Module,
     tensor::{
-        ElementConversion, Int, Tensor,
+        Device, ElementConversion, Int, Tensor,
         activation::{log_softmax, softmax},
     },
 };
@@ -23,16 +21,16 @@ use std::{
 
 /// Compute mel spectrogram on CPU (Flex backend) to avoid GPU kernel launch
 /// overhead for the many small STFT operations, then upload to the target device.
-fn compute_mel_cpu<B: CustomKernelsBackend>(
+fn compute_mel_cpu(
     waveform: &[f32],
     sample_rate: usize,
     n_mels: usize,
-    device: &B::Device,
-) -> Tensor<B, 3> {
-    let cpu_device = FlexDevice::default();
-    let wav: Tensor<Flex, 1> = Tensor::from_floats(waveform, &cpu_device);
-    let mel: Tensor<Flex, 3> = prep_audio(wav.unsqueeze(), sample_rate as f64, n_mels);
-    Tensor::<B, 3>::from_data(mel.into_data(), device)
+    device: &Device,
+) -> Tensor<3> {
+    let cpu_device = Device::flex();
+    let wav: Tensor<1> = Tensor::from_floats(waveform, &cpu_device);
+    let mel: Tensor<3> = prep_audio(wav.unsqueeze(), sample_rate as f64, n_mels);
+    Tensor::<3>::from_data(mel.into_data(), device)
 }
 
 // Non-speech tokens to suppress when suppress_nst is enabled
@@ -254,8 +252,8 @@ fn parse_requested_language(language: &str) -> token::Result<Option<Language>> {
 
 /// Detect the language of the audio using the first 30s chunk.
 /// Returns detected language and its probability.
-pub fn detect_language<B: CustomKernelsBackend>(
-    whisper: &Whisper<B>,
+pub fn detect_language(
+    whisper: &Whisper,
     bpe: &Gpt2Tokenizer,
     waveform: &[f32],
     sample_rate: usize,
@@ -271,7 +269,7 @@ pub fn detect_language<B: CustomKernelsBackend>(
     let n_audio_ctx = whisper.encoder_ctx_size();
     let mel_frame_count = n_audio_ctx * 2;
 
-    let full_mel = compute_mel_cpu::<B>(waveform, sample_rate, n_mels, &device);
+    let full_mel = compute_mel_cpu(waveform, sample_rate, n_mels, &device);
     let [nb, nm, total] = full_mel.dims();
 
     let mel_chunk = if total >= mel_frame_count {
@@ -319,14 +317,14 @@ pub fn detect_language<B: CustomKernelsBackend>(
     let (best_lang, best_prob) = if language_ids.is_empty() {
         (Language::English, 0.0f32)
     } else {
-        let language_indices = Tensor::<B, 1, Int>::from_ints(
+        let language_indices = Tensor::<1, Int>::from_ints(
             TensorData::new(language_ids, [languages.len()]),
             &device,
         );
         let language_probs = probs.select(0, language_indices);
         let (best_prob_tensor, best_index_tensor) = language_probs.topk_with_indices(1, 0);
-        let best_prob: f32 = best_prob_tensor.into_scalar().elem();
-        let best_index: i32 = best_index_tensor.into_scalar().elem();
+        let best_prob: f32 = best_prob_tensor.into_scalar::<f32>().elem();
+        let best_index: i32 = best_index_tensor.into_scalar::<i32>().elem();
         (languages[best_index as usize], best_prob)
     };
 
@@ -336,8 +334,8 @@ pub fn detect_language<B: CustomKernelsBackend>(
     })
 }
 
-pub fn transcribe<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
-    whisper: &Whisper<B>,
+pub fn transcribe<F: FnMut(usize, usize) -> bool>(
+    whisper: &Whisper,
     bpe: &Gpt2Tokenizer,
     waveform: &[f32],
     sample_rate: usize,
@@ -357,13 +355,13 @@ pub fn transcribe<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
 
 /// Like `transcribe`, but accepts a pre-computed encoder output to skip encoding.
 /// Used by `transcribe_regions_batched` to amortise encoder cost across regions.
-fn transcribe_inner<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
-    whisper: &Whisper<B>,
+fn transcribe_inner<F: FnMut(usize, usize) -> bool>(
+    whisper: &Whisper,
     bpe: &Gpt2Tokenizer,
     waveform: &[f32],
     sample_rate: usize,
     params: &WhisperParams,
-    pre_encoded: Option<Tensor<B, 3>>,
+    pre_encoded: Option<Tensor<3>>,
     mut progress_callback: Option<F>,
 ) -> token::Result<TranscriptionResult> {
     let device = whisper.devices()[0].clone();
@@ -396,7 +394,7 @@ fn transcribe_inner<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
     };
     let effective_mel_frame_count = effective_audio_ctx * 2;
 
-    let full_mel = compute_mel_cpu::<B>(waveform, sample_rate, n_mels, &device);
+    let full_mel = compute_mel_cpu(waveform, sample_rate, n_mels, &device);
     let [_, _, total_mel_frames] = full_mel.dims();
 
     // Seek range (in 10ms mel frames)
@@ -906,8 +904,8 @@ const DEFAULT_MAX_BATCH_SIZE: usize = 10;
 ///
 /// Falls back to sequential `transcribe()` for beam-search or sampling
 /// (temperature > 0) strategies.
-pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize) -> bool>(
-    whisper: &Whisper<B>,
+pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
+    whisper: &Whisper,
     bpe: &Gpt2Tokenizer,
     regions: &[&[f32]],
     sample_rate: usize,
@@ -1112,10 +1110,10 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
         let batch_size = batch_regions.len();
 
         // 1. Compute mel spectrograms on CPU, then stack and upload
-        let mut mel_tensors: Vec<Tensor<B, 3>> = Vec::with_capacity(batch_size);
+        let mut mel_tensors: Vec<Tensor<3>> = Vec::with_capacity(batch_size);
         let mut seek_end_per_region: Vec<usize> = Vec::with_capacity(batch_size);
         for waveform in batch_regions.iter() {
-            let mel = compute_mel_cpu::<B>(waveform, sample_rate, n_mels, &device);
+            let mel = compute_mel_cpu(waveform, sample_rate, n_mels, &device);
             let [nb, nm, total] = mel.dims();
             seek_end_per_region.push(total);
             let padded = if total >= mel_frame_count {
@@ -1232,7 +1230,7 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
         let prompt_data: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
         // Repeat prompt for batch: [N, prompt_len]
         let single_prompt =
-            Tensor::<B, 2, Int>::from_ints(TensorData::new(prompt_data, [1, prompt_len]), &device);
+            Tensor::<2, Int>::from_ints(TensorData::new(prompt_data, [1, prompt_len]), &device);
         let batched_prompt = single_prompt.repeat_dim(0, batch_size);
 
         let prompt_output = if let Some(ref fused) = fused_weights {
@@ -1251,7 +1249,7 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
         let mut cache = prompt_output.cache;
         // Extract last-position logits for each region: [N, vocab_size]
         let last_pos = prompt_len - 1;
-        let batched_logits: Tensor<B, 2> = prompt_output
+        let batched_logits: Tensor<2> = prompt_output
             .logits
             .slice([0..batch_size, last_pos..last_pos + 1])
             .reshape([batch_size, vocab_size]);
@@ -1359,7 +1357,7 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
                     }
                 })
                 .collect();
-            let token_tensor = Tensor::<B, 2, Int>::from_ints(
+            let token_tensor = Tensor::<2, Int>::from_ints(
                 TensorData::new(next_tokens, [batch_size, 1]),
                 &device,
             );
@@ -1392,7 +1390,7 @@ pub fn transcribe_regions_batched<B: CustomKernelsBackend, F: FnMut(usize, usize
             };
 
             // Pull logits to CPU: [N, 1, vocab_size] → [N * vocab_size]
-            let logits_2d: Tensor<B, 2> = step_output.logits.reshape([batch_size, vocab_size]);
+            let logits_2d: Tensor<2> = step_output.logits.reshape([batch_size, vocab_size]);
             let logits_data = logits_2d.into_data().convert::<f32>();
             let logits_flat = logits_data.to_vec::<f32>().unwrap();
 
@@ -1864,9 +1862,9 @@ struct BatchedBeamDecoder {
 ///
 /// The combined GPU batch dimension is `n_regions × beam_size`, allowing
 /// a single forward pass to serve all beams across all regions.
-fn decode_regions_beam_batched<B: CustomKernelsBackend>(
-    whisper: &Whisper<B>,
-    encoder_output: Tensor<B, 3>,
+fn decode_regions_beam_batched(
+    whisper: &Whisper,
+    encoder_output: Tensor<3>,
     n_regions: usize,
     prompt: &[usize],
     n_max: usize,
@@ -1881,8 +1879,8 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
     seek_ends: &[usize],
     n_audio_ctx: usize,
     beam_size: usize,
-    fused_weights: &Option<FusedDecoderWeights<B>>,
-    device: &B::Device,
+    fused_weights: &Option<FusedDecoderWeights>,
+    device: &Device,
 ) -> Vec<SegmentDecodeResult> {
     let total_beams = n_regions * beam_size;
     let delta_min = 10usize;
@@ -1894,7 +1892,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
     let [_, enc_seq, enc_dim] = encoder_output.dims();
     let expanded_encoder = {
         // Repeat each region's output beam_size times via repeat_interleave-like operation
-        let mut slices: Vec<Tensor<B, 3>> = Vec::with_capacity(total_beams);
+        let mut slices: Vec<Tensor<3>> = Vec::with_capacity(total_beams);
         for r in 0..n_regions {
             let region_enc = encoder_output
                 .clone()
@@ -1915,7 +1913,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
 
     let prompt_data: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
     let single_prompt =
-        Tensor::<B, 2, Int>::from_ints(TensorData::new(prompt_data, [1, prompt.len()]), device);
+        Tensor::<2, Int>::from_ints(TensorData::new(prompt_data, [1, prompt.len()]), device);
     let batched_prompt = single_prompt.repeat_dim(0, total_beams);
 
     let prompt_output = if let Some(fused) = fused_weights.as_ref() {
@@ -1935,7 +1933,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
     let mut batched_cache = prompt_output.cache;
 
     // Extract per-beam logits: [total_beams, vocab_size]
-    let all_logits: Tensor<B, 2> = prompt_output
+    let all_logits: Tensor<2> = prompt_output
         .logits
         .slice([0..total_beams, prompt_last_pos..prompt_last_pos + 1])
         .reshape([total_beams, vocab_size]);
@@ -2297,10 +2295,10 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
 
         // Reorder cache and run forward pass
         let reorder_tensor =
-            Tensor::<B, 1, Int>::from_ints(TensorData::new(global_reorder, [total_beams]), device);
+            Tensor::<1, Int>::from_ints(TensorData::new(global_reorder, [total_beams]), device);
         batched_cache = batched_cache.reorder_beams(reorder_tensor);
 
-        let token_tensor = Tensor::<B, 2, Int>::from_ints(
+        let token_tensor = Tensor::<2, Int>::from_ints(
             TensorData::new(global_next_tokens, [total_beams, 1]),
             device,
         );
@@ -2332,7 +2330,7 @@ fn decode_regions_beam_batched<B: CustomKernelsBackend>(
         };
 
         // Extract per-beam logits
-        let logits_2d: Tensor<B, 2> = step_output.logits.reshape([total_beams, vocab_size]);
+        let logits_2d: Tensor<2> = step_output.logits.reshape([total_beams, vocab_size]);
         let logits_data = logits_2d.into_data().convert::<f32>();
         let logits_flat = logits_data.to_vec::<f32>().unwrap();
 
@@ -2425,10 +2423,10 @@ fn sequence_score_from_result(result: &SegmentDecodeResult, length_penalty: f32)
     sequence_score(result.sum_logprobs, result.result_len, length_penalty)
 }
 
-fn decode_segment<B: CustomKernelsBackend>(
-    whisper: &Whisper<B>,
+fn decode_segment(
+    whisper: &Whisper,
     _bpe: &Gpt2Tokenizer,
-    encoder_output: &Tensor<B, 3>,
+    encoder_output: &Tensor<3>,
     prompt: &[usize],
     temperature: f32,
     n_max: usize,
@@ -2447,7 +2445,7 @@ fn decode_segment<B: CustomKernelsBackend>(
     n_audio_ctx: usize,
     beam_size: usize,
     beam_rngs: &mut [MT19937],
-    device: &B::Device,
+    device: &Device,
 ) -> SegmentDecodeResult {
     if matches!(params.strategy, SamplingStrategy::BeamSearch { .. })
         && temperature <= 0.0
@@ -2539,9 +2537,9 @@ fn decode_segment<B: CustomKernelsBackend>(
     best_result.or(fallback_result).unwrap()
 }
 
-fn decode_segment_candidate<B: CustomKernelsBackend>(
-    whisper: &Whisper<B>,
-    encoder_output: &Tensor<B, 3>,
+fn decode_segment_candidate(
+    whisper: &Whisper,
+    encoder_output: &Tensor<3>,
     prompt: &[usize],
     temperature: f32,
     n_max: usize,
@@ -2559,7 +2557,7 @@ fn decode_segment_candidate<B: CustomKernelsBackend>(
     n_audio_ctx: usize,
     use_sampling: bool,
     rng: Option<&mut MT19937>,
-    device: &B::Device,
+    device: &Device,
 ) -> SegmentDecodeResult {
     let mut tokens_out: Vec<(usize, f64, usize)> = Vec::new();
     let mut token_alignments: Vec<Vec<f32>> = Vec::new();
@@ -2598,7 +2596,7 @@ fn decode_segment_candidate<B: CustomKernelsBackend>(
     };
     let prompt_last_pos = full_tokens.len() - 1;
     let mut cache = prompt_output.cache;
-    let mut pending_logits: Tensor<B, 1> = prompt_output
+    let mut pending_logits: Tensor<1> = prompt_output
         .logits
         .slice([0..1, prompt_last_pos..prompt_last_pos + 1])
         .flatten::<1>(0, 2);
@@ -2622,7 +2620,7 @@ fn decode_segment_candidate<B: CustomKernelsBackend>(
             }
         })
         .collect();
-    let gpu_static_suppress: Tensor<B, 1> =
+    let gpu_static_suppress: Tensor<1> =
         Tensor::from_floats(static_suppress_data.as_slice(), device);
     let blank_suppress_data: Vec<f32> = (0..vocab_size)
         .map(|id| {
@@ -2633,9 +2631,9 @@ fn decode_segment_candidate<B: CustomKernelsBackend>(
             }
         })
         .collect();
-    let gpu_blank_suppress: Tensor<B, 1> =
+    let gpu_blank_suppress: Tensor<1> =
         Tensor::from_floats(blank_suppress_data.as_slice(), device);
-    let gpu_indices: Tensor<B, 1, Int> = Tensor::arange(0..vocab_size as i64, device);
+    let gpu_indices: Tensor<1, Int> = Tensor::arange(0..vocab_size as i64, device);
 
     for i in 0..n_max {
         // Use cached logits from previous step (or prompt output)
@@ -2647,7 +2645,7 @@ fn decode_segment_candidate<B: CustomKernelsBackend>(
             if token_nosp < vocab_size {
                 no_speech_prob = probs
                     .slice([token_nosp..token_nosp + 1])
-                    .into_scalar()
+                    .into_scalar::<f32>()
                     .elem();
             }
         }
@@ -3088,8 +3086,8 @@ fn compute_uniform_token_timestamps_for_segment(
 /// track audio-text alignment; averaging them drowns the signal from the few
 /// "alignment heads" that do.  The last layer has the strongest alignment signal,
 /// and max-over-heads preserves it even when most heads attend elsewhere.
-pub(crate) fn average_cross_attention_for_token<B: CustomKernelsBackend>(
-    cross_attention_weights: &[Tensor<B, 4>],
+pub(crate) fn average_cross_attention_for_token(
+    cross_attention_weights: &[Tensor<4>],
     token_index: usize,
 ) -> Vec<f32> {
     if cross_attention_weights.is_empty() {
@@ -3123,8 +3121,8 @@ pub(crate) fn average_cross_attention_for_token<B: CustomKernelsBackend>(
 /// Batched version of `average_cross_attention_for_token`.
 /// Uses last layer + max-over-heads (see docs on the single-element version).
 /// Performs a single GPU→CPU transfer for the whole batch.
-fn average_cross_attention_batched<B: CustomKernelsBackend>(
-    cross_attention_weights: &[Tensor<B, 4>],
+fn average_cross_attention_batched(
+    cross_attention_weights: &[Tensor<4>],
     token_index: usize,
     batch_size: usize,
 ) -> Vec<Vec<f32>> {
@@ -3150,7 +3148,7 @@ fn average_cross_attention_batched<B: CustomKernelsBackend>(
         ])
         .reshape([batch_size, n_head, n_ctx]);
 
-    let maxed: Tensor<B, 2> = heads.max_dim(1).reshape([batch_size, n_ctx]);
+    let maxed: Tensor<2> = heads.max_dim(1).reshape([batch_size, n_ctx]);
     let flat = maxed.into_data().convert::<f32>().to_vec::<f32>().unwrap();
 
     (0..batch_size)
@@ -3261,3 +3259,4 @@ pub fn format_timestamp(frames: i64) -> String {
     let h = m / 60;
     format!("{:02}:{:02}:{:02},{:03}", h, m % 60, s % 60, ms % 1000)
 }
+

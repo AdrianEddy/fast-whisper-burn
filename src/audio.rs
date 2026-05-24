@@ -1,4 +1,4 @@
-use burn::tensor::{ElementConversion, Tensor, activation::relu, backend::Backend};
+﻿use burn::tensor::{Device, ElementConversion, Tensor, activation::relu};
 
 use crate::helper::*;
 
@@ -27,11 +27,11 @@ fn is_odd(x: usize) -> bool {
 /// n_samples_padded = if n_fft is even: n_samples + n_fft else: n_samples + n_fft - 1,
 /// n_fft = 400,
 /// hop_length = 160.
-pub fn prep_audio<B: Backend>(
-    waveform: Tensor<B, 2>,
+pub fn prep_audio(
+    waveform: Tensor<2>,
     sample_rate: f64,
     n_mels: usize,
-) -> Tensor<B, 3> {
+) -> Tensor<3> {
     let device = waveform.device();
 
     let window = hann_window_device(WINDOW_LENGTH, &device);
@@ -47,20 +47,20 @@ pub fn prep_audio<B: Backend>(
 
     let log_spec = tensor_log10(tensor_max_scalar(mel_spec, 1.0e-10));
 
-    let max: f64 = log_spec.clone().max().into_scalar().elem();
+    let max: f64 = log_spec.clone().max().into_scalar::<f64>().elem();
 
     let log_spec = tensor_max_scalar(log_spec, max - 8.0);
 
     (log_spec + 4.0) / 4.0
 }
 
-fn get_mel_filters_device<B: Backend>(
+fn get_mel_filters_device(
     sample_rate: f64,
     n_fft: usize,
     n_mels: usize,
     htk: bool,
-    device: &B::Device,
-) -> Tensor<B, 2> {
+    device: &Device,
+) -> Tensor<2> {
     let fmin = 0.0;
     let fmax = sample_rate * 0.5;
 
@@ -133,24 +133,24 @@ fn get_mel_filters_device<B: Backend>(
     weights
 }
 
-fn fft_frequencies_device<B: Backend>(
+fn fft_frequencies_device(
     sample_rate: f64,
     n_fft: usize,
-    device: &B::Device,
-) -> Tensor<B, 1> {
+    device: &Device,
+) -> Tensor<1> {
     //return np.fft.rfftfreq(n=n_fft, d=1.0 / sr)
     Tensor::arange(0..(n_fft / 2 + 1) as i64, device)
         .float()
         .mul_scalar(sample_rate / n_fft as f64)
 }
 
-fn mel_frequencies_device<B: Backend>(
+fn mel_frequencies_device(
     n_mels: usize,
     fmin: f64,
     fmax: f64,
     htk: bool,
-    device: &B::Device,
-) -> Tensor<B, 1> {
+    device: &Device,
+) -> Tensor<1> {
     // 'Center freqs' of mel bands - uniformly spaced between limits
     let min_mel = hz_to_mel(fmin, htk);
     let max_mel = hz_to_mel(fmax, htk);
@@ -197,7 +197,7 @@ fn hz_to_mel(freq: f64, htk: bool) -> f64 {
     }
 }
 
-fn mel_to_hz_tensor<B: Backend>(mel: Tensor<B, 1>, htk: bool) -> Tensor<B, 1> {
+fn mel_to_hz_tensor(mel: Tensor<1>, htk: bool) -> Tensor<1> {
     if htk {
         return (_10pow(mel / 2595.0) - 1.0) * 700.0;
     }
@@ -232,11 +232,11 @@ fn mel_to_hz_tensor<B: Backend>(mel: Tensor<B, 1>, htk: bool) -> Tensor<B, 1> {
         + (-log_t + 1.0) * (mel * f_sp + f_min)
 }
 
-pub fn hann_window<B: Backend>(window_length: usize) -> Tensor<B, 1> {
-    hann_window_device(window_length, &B::Device::default())
+pub fn hann_window(window_length: usize) -> Tensor<1> {
+    hann_window_device(window_length, &Device::default())
 }
 
-pub fn hann_window_device<B: Backend>(window_length: usize, device: &B::Device) -> Tensor<B, 1> {
+pub fn hann_window_device(window_length: usize, device: &Device) -> Tensor<1> {
     let s = Tensor::arange(0..window_length as i64, device)
         .float()
         .mul_scalar(std::f64::consts::PI / window_length as f64)
@@ -248,12 +248,12 @@ pub fn hann_window_device<B: Backend>(window_length: usize, device: &B::Device) 
 /// The size of each returned tensor is (n_batch, n_freq, n_frame)
 /// where n_freq = int(n_fft / 2 + 1), n_frame = int( ( n_sample_padded - n_fft ) / hop_length ) + 1,
 /// n_sample_padded = if n_fft is even: n_sample + n_fft else: n_sample + n_fft - 1.
-pub fn stfft<B: Backend>(
-    input: Tensor<B, 2>,
+pub fn stfft(
+    input: Tensor<2>,
     n_fft: usize,
     hop_length: usize,
-    window: Tensor<B, 1>,
-) -> (Tensor<B, 3>, Tensor<B, 3>) {
+    window: Tensor<1>,
+) -> (Tensor<3>, Tensor<3>) {
     let [n_batch, orig_input_size] = input.dims();
 
     assert!(orig_input_size >= n_fft);
@@ -337,3 +337,4 @@ pub fn stfft<B: Backend>(
 fn div_roundup(a: usize, b: usize) -> usize {
     a.div_ceil(b)
 }
+

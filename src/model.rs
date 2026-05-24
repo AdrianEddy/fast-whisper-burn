@@ -1,4 +1,4 @@
-use burn::{
+﻿use burn::{
     config::Config,
     module::{Module, Param},
     nn::{
@@ -6,12 +6,10 @@ use burn::{
         attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig},
         conv::{Conv1d, Conv1dConfig},
     },
-    tensor::{Bool, Distribution, FloatDType, Int, Tensor, backend::Backend, module::embedding},
+    tensor::{Bool, Device, Distribution, FloatDType, Int, Tensor, module::embedding},
 };
 
-use crate::custom_kernels::{
-    CustomKernelsBackend, fused_single_query_attn, layer_norm_mixed, softmax_mixed,
-};
+use crate::custom_kernels::{fused_single_query_attn, layer_norm_mixed, softmax_mixed};
 
 #[derive(Config, Debug)]
 pub struct WhisperConfig {
@@ -20,7 +18,7 @@ pub struct WhisperConfig {
 }
 
 impl WhisperConfig {
-    pub fn init<B: Backend>(&self, tensor_device_ref: &B::Device) -> Whisper<B> {
+    pub fn init(&self, tensor_device_ref: &Device) -> Whisper {
         let n_audio_state = self.audio_encoder_config.n_audio_state;
         let n_text_state = self.text_decoder_config.n_text_state;
 
@@ -37,64 +35,64 @@ impl WhisperConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct Whisper<B: Backend> {
-    encoder: AudioEncoder<B>,
-    decoder: TextDecoder<B>,
+pub struct Whisper {
+    encoder: AudioEncoder,
+    decoder: TextDecoder,
 }
 
-impl<B: CustomKernelsBackend> Whisper<B> {
-    pub fn forward(&self, mel: Tensor<B, 3>, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+impl Whisper {
+    pub fn forward(&self, mel: Tensor<3>, tokens: Tensor<2, Int>) -> Tensor<3> {
         let encoder_output = self.encoder.forward(mel, false);
         self.decoder.forward(tokens, encoder_output)
     }
 
-    pub fn forward_encoder(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward_encoder(&self, mel: Tensor<3>) -> Tensor<3> {
         self.encoder.forward(mel, false)
     }
 
-    pub fn forward_encoder_f16(&self, mel: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward_encoder_f16(&self, mel: Tensor<3>) -> Tensor<3> {
         self.encoder.forward(mel, true)
     }
 
     pub fn forward_decoder(
         &self,
-        tokens: Tensor<B, 2, Int>,
-        encoder_output: Tensor<B, 3>,
-    ) -> Tensor<B, 3> {
+        tokens: Tensor<2, Int>,
+        encoder_output: Tensor<3>,
+    ) -> Tensor<3> {
         self.decoder.forward(tokens, encoder_output)
     }
 
     pub fn forward_decoder_with_cross_attention(
         &self,
-        tokens: Tensor<B, 2, Int>,
-        encoder_output: Tensor<B, 3>,
-    ) -> DecoderForwardOutput<B> {
+        tokens: Tensor<2, Int>,
+        encoder_output: Tensor<3>,
+    ) -> DecoderForwardOutput {
         self.decoder
             .forward_with_cross_attention(tokens, encoder_output)
     }
 
-    pub fn create_decoder_cache(&self, encoder_output: Tensor<B, 3>) -> DecoderCache<B> {
+    pub fn create_decoder_cache(&self, encoder_output: Tensor<3>) -> DecoderCache {
         self.decoder.create_cache(encoder_output, false)
     }
 
-    pub fn create_decoder_cache_f16(&self, encoder_output: Tensor<B, 3>) -> DecoderCache<B> {
+    pub fn create_decoder_cache_f16(&self, encoder_output: Tensor<3>) -> DecoderCache {
         self.decoder.create_cache(encoder_output, true)
     }
 
     pub fn forward_decoder_cached_with_cross_attention(
         &self,
-        tokens: Tensor<B, 2, Int>,
-        cache: DecoderCache<B>,
-    ) -> CachedDecoderForwardOutput<B> {
+        tokens: Tensor<2, Int>,
+        cache: DecoderCache,
+    ) -> CachedDecoderForwardOutput {
         self.decoder
             .forward_cached_with_cross_attention(tokens, cache, false, None)
     }
 
     pub fn forward_decoder_cached_with_cross_attention_f16(
         &self,
-        tokens: Tensor<B, 2, Int>,
-        cache: DecoderCache<B>,
-    ) -> CachedDecoderForwardOutput<B> {
+        tokens: Tensor<2, Int>,
+        cache: DecoderCache,
+    ) -> CachedDecoderForwardOutput {
         self.decoder
             .forward_cached_with_cross_attention(tokens, cache, true, None)
     }
@@ -115,7 +113,7 @@ impl<B: CustomKernelsBackend> Whisper<B> {
     }
 
     /// Pre-compute fused QKV weights for all decoder layers (call once before inference).
-    pub fn build_fused_decoder_weights(&self) -> FusedDecoderWeights<B> {
+    pub fn build_fused_decoder_weights(&self) -> FusedDecoderWeights {
         let self_attn_qkv = self
             .decoder
             .blocks
@@ -158,11 +156,11 @@ impl<B: CustomKernelsBackend> Whisper<B> {
 
     pub fn forward_decoder_cached_with_cross_attention_fused(
         &self,
-        tokens: Tensor<B, 2, Int>,
-        cache: DecoderCache<B>,
-        fused: &FusedDecoderWeights<B>,
+        tokens: Tensor<2, Int>,
+        cache: DecoderCache,
+        fused: &FusedDecoderWeights,
         use_f16: bool,
-    ) -> CachedDecoderForwardOutput<B> {
+    ) -> CachedDecoderForwardOutput {
         self.decoder
             .forward_cached_with_cross_attention(tokens, cache, use_f16, Some(fused))
     }
@@ -170,46 +168,46 @@ impl<B: CustomKernelsBackend> Whisper<B> {
 
 /// Pre-computed fused weights for all decoder layers.
 /// Computed once before inference to avoid per-step overhead.
-pub struct FusedDecoderWeights<B: Backend> {
+pub struct FusedDecoderWeights {
     /// For each layer: self-attn QKV weight [d_model, 3*d_model] and bias [3*d_model]
-    self_attn_qkv: Vec<(Tensor<B, 2>, Tensor<B, 1>)>,
+    self_attn_qkv: Vec<(Tensor<2>, Tensor<1>)>,
     /// Pre-computed logit projection matrix: token_embedding transposed + cast to f16
     /// Shape: [1, d_model, vocab_size]
-    logit_embed: Tensor<B, 3>,
+    logit_embed: Tensor<3>,
 }
 
-pub struct DecoderForwardOutput<B: Backend> {
-    pub logits: Tensor<B, 3>,
-    pub cross_attention_weights: Vec<Tensor<B, 4>>,
+pub struct DecoderForwardOutput {
+    pub logits: Tensor<3>,
+    pub cross_attention_weights: Vec<Tensor<4>>,
 }
 
 /// Self-attention KV cache stored in head-split 4D format [batch, heads, seq, d_k].
 #[derive(Clone, Debug)]
-pub struct DecoderSelfAttentionCache<B: Backend> {
-    key: Option<Tensor<B, 4>>,
-    value: Option<Tensor<B, 4>>,
+pub struct DecoderSelfAttentionCache {
+    key: Option<Tensor<4>>,
+    value: Option<Tensor<4>>,
 }
 
 /// Cross-attention KV cache stored in head-split 4D format [batch, heads, seq, d_k].
 #[derive(Clone, Debug)]
-pub struct DecoderCrossAttentionCache<B: Backend> {
-    key: Tensor<B, 4>,
-    value: Tensor<B, 4>,
+pub struct DecoderCrossAttentionCache {
+    key: Tensor<4>,
+    value: Tensor<4>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DecoderLayerCache<B: Backend> {
-    self_attention: DecoderSelfAttentionCache<B>,
-    cross_attention: DecoderCrossAttentionCache<B>,
+pub struct DecoderLayerCache {
+    self_attention: DecoderSelfAttentionCache,
+    cross_attention: DecoderCrossAttentionCache,
 }
 
 #[derive(Clone, Debug)]
-pub struct DecoderCache<B: Backend> {
-    layers: Vec<DecoderLayerCache<B>>,
+pub struct DecoderCache {
+    layers: Vec<DecoderLayerCache>,
     n_past: usize,
 }
 
-impl<B: Backend> DecoderCache<B> {
+impl DecoderCache {
     /// Stack multiple batch=1 caches into one cache with batch=N (along dim 0).
     /// All caches must have the same `n_past` and layer count.
     pub fn stack(caches: Vec<Self>) -> Self {
@@ -219,19 +217,19 @@ impl<B: Backend> DecoderCache<B> {
 
         let layers = (0..n_layers)
             .map(|i| {
-                let self_keys: Vec<Tensor<B, 4>> = caches
+                let self_keys: Vec<Tensor<4>> = caches
                     .iter()
                     .map(|c| c.layers[i].self_attention.key.clone().unwrap())
                     .collect();
-                let self_values: Vec<Tensor<B, 4>> = caches
+                let self_values: Vec<Tensor<4>> = caches
                     .iter()
                     .map(|c| c.layers[i].self_attention.value.clone().unwrap())
                     .collect();
-                let cross_keys: Vec<Tensor<B, 4>> = caches
+                let cross_keys: Vec<Tensor<4>> = caches
                     .iter()
                     .map(|c| c.layers[i].cross_attention.key.clone())
                     .collect();
-                let cross_values: Vec<Tensor<B, 4>> = caches
+                let cross_values: Vec<Tensor<4>> = caches
                     .iter()
                     .map(|c| c.layers[i].cross_attention.value.clone())
                     .collect();
@@ -259,10 +257,10 @@ impl<B: Backend> DecoderCache<B> {
 
         // Pre-split all layers' tensors
         let mut layer_splits: Vec<(
-            Vec<Tensor<B, 4>>,
-            Vec<Tensor<B, 4>>,
-            Vec<Tensor<B, 4>>,
-            Vec<Tensor<B, 4>>,
+            Vec<Tensor<4>>,
+            Vec<Tensor<4>>,
+            Vec<Tensor<4>>,
+            Vec<Tensor<4>>,
         )> = Vec::with_capacity(n_layers);
 
         for layer in self.layers {
@@ -302,7 +300,7 @@ impl<B: Backend> DecoderCache<B> {
 
     /// Reorder beams in a batched cache using index_select along the batch dimension.
     /// `indices[i]` = source beam index for new beam position `i`.
-    pub fn reorder_beams(self, indices: Tensor<B, 1, Int>) -> Self {
+    pub fn reorder_beams(self, indices: Tensor<1, Int>) -> Self {
         DecoderCache {
             layers: self
                 .layers
@@ -329,16 +327,16 @@ impl<B: Backend> DecoderCache<B> {
     }
 }
 
-pub struct CachedDecoderForwardOutput<B: Backend> {
-    pub logits: Tensor<B, 3>,
-    pub cross_attention_weights: Vec<Tensor<B, 4>>,
-    pub cache: DecoderCache<B>,
+pub struct CachedDecoderForwardOutput {
+    pub logits: Tensor<3>,
+    pub cross_attention_weights: Vec<Tensor<4>>,
+    pub cache: DecoderCache,
 }
 
-struct DecoderBlockCachedOutput<B: Backend> {
-    output: Tensor<B, 3>,
-    cross_attention_weights: Tensor<B, 4>,
-    cache: DecoderLayerCache<B>,
+struct DecoderBlockCachedOutput {
+    output: Tensor<3>,
+    cross_attention_weights: Tensor<4>,
+    cache: DecoderLayerCache,
 }
 
 #[derive(Config, Debug)]
@@ -351,7 +349,7 @@ pub struct TextDecoderConfig {
 }
 
 impl TextDecoderConfig {
-    pub fn init<B: Backend>(&self, tensor_device_ref: &B::Device) -> TextDecoder<B> {
+    pub fn init(&self, tensor_device_ref: &Device) -> TextDecoder {
         let token_embedding = Param::from_tensor(Tensor::random(
             [self.n_vocab, self.n_text_state],
             Distribution::Normal(0.0, 1.0),
@@ -385,17 +383,17 @@ impl TextDecoderConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct TextDecoder<B: Backend> {
-    token_embedding: Param<Tensor<B, 2>>,
-    positional_embedding: Param<Tensor<B, 2>>,
-    blocks: Vec<ResidualDecoderAttentionBlock<B>>,
-    ln: nn::LayerNorm<B>,
+pub struct TextDecoder {
+    token_embedding: Param<Tensor<2>>,
+    positional_embedding: Param<Tensor<2>>,
+    blocks: Vec<ResidualDecoderAttentionBlock>,
+    ln: nn::LayerNorm,
     n_vocab: usize,
     n_text_ctx: usize,
 }
 
-impl<B: CustomKernelsBackend> TextDecoder<B> {
-    fn forward(&self, x: Tensor<B, 2, Int>, xa: Tensor<B, 3>) -> Tensor<B, 3> {
+impl TextDecoder {
+    fn forward(&self, x: Tensor<2, Int>, xa: Tensor<3>) -> Tensor<3> {
         let [_n_batch, seq_len] = x.dims();
 
         assert!(
@@ -413,7 +411,7 @@ impl<B: CustomKernelsBackend> TextDecoder<B> {
                 .slice([0..seq_len])
                 .unsqueeze::<3>();
 
-        let mask = causal_mask::<B>(seq_len, 0, &device);
+        let mask = causal_mask(seq_len, 0, &device);
 
         let mut x = x;
         for block in self.blocks.iter() {
@@ -426,9 +424,9 @@ impl<B: CustomKernelsBackend> TextDecoder<B> {
 
     fn forward_with_cross_attention(
         &self,
-        x: Tensor<B, 2, Int>,
-        xa: Tensor<B, 3>,
-    ) -> DecoderForwardOutput<B> {
+        x: Tensor<2, Int>,
+        xa: Tensor<3>,
+    ) -> DecoderForwardOutput {
         let [_n_batch, seq_len] = x.dims();
 
         assert!(
@@ -446,7 +444,7 @@ impl<B: CustomKernelsBackend> TextDecoder<B> {
                 .slice([0..seq_len])
                 .unsqueeze::<3>();
 
-        let mask = causal_mask::<B>(seq_len, 0, &device);
+        let mask = causal_mask(seq_len, 0, &device);
 
         let mut x = x;
         let mut cross_attention_weights = Vec::with_capacity(self.blocks.len());
@@ -466,7 +464,7 @@ impl<B: CustomKernelsBackend> TextDecoder<B> {
         }
     }
 
-    fn create_cache(&self, xa: Tensor<B, 3>, use_f16: bool) -> DecoderCache<B> {
+    fn create_cache(&self, xa: Tensor<3>, use_f16: bool) -> DecoderCache {
         let layers = self
             .blocks
             .iter()
@@ -484,11 +482,11 @@ impl<B: CustomKernelsBackend> TextDecoder<B> {
 
     fn forward_cached_with_cross_attention(
         &self,
-        x: Tensor<B, 2, Int>,
-        cache: DecoderCache<B>,
+        x: Tensor<2, Int>,
+        cache: DecoderCache,
         use_f16: bool,
-        fused_qkv: Option<&FusedDecoderWeights<B>>,
-    ) -> CachedDecoderForwardOutput<B> {
+        fused_qkv: Option<&FusedDecoderWeights>,
+    ) -> CachedDecoderForwardOutput {
         let [_n_batch, seq_len] = x.dims();
 
         assert!(
@@ -517,7 +515,7 @@ impl<B: CustomKernelsBackend> TextDecoder<B> {
         // For seq_len=1 (autoregressive step), the causal mask is trivially all-false
         // (the single query can attend to all past tokens), so skip mask generation entirely.
         let mask = if seq_len > 1 {
-            Some(causal_mask::<B>(seq_len, cache.n_past, &device))
+            Some(causal_mask(seq_len, cache.n_past, &device))
         } else {
             None
         };
@@ -585,7 +583,7 @@ pub struct AudioEncoderConfig {
 }
 
 impl AudioEncoderConfig {
-    pub fn init<B: Backend>(&self, tensor_device_ref: &B::Device) -> AudioEncoder<B> {
+    pub fn init(&self, tensor_device_ref: &Device) -> AudioEncoder {
         let conv1 = Conv1dConfig::new(self.n_mels, self.n_audio_state, 3)
             .with_padding(PaddingConfig1d::Explicit(1, 1))
             .init(tensor_device_ref);
@@ -625,20 +623,20 @@ impl AudioEncoderConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct AudioEncoder<B: Backend> {
-    conv1: Conv1d<B>,
+pub struct AudioEncoder {
+    conv1: Conv1d,
     gelu1: nn::Gelu,
-    conv2: Conv1d<B>,
+    conv2: Conv1d,
     gelu2: nn::Gelu,
-    blocks: Vec<ResidualEncoderAttentionBlock<B>>,
-    ln_post: nn::LayerNorm<B>,
-    positional_embedding: Param<Tensor<B, 2>>,
+    blocks: Vec<ResidualEncoderAttentionBlock>,
+    ln_post: nn::LayerNorm,
+    positional_embedding: Param<Tensor<2>>,
     n_mels: usize,
     n_audio_ctx: usize,
 }
 
-impl<B: CustomKernelsBackend> AudioEncoder<B> {
-    fn forward(&self, x: Tensor<B, 3>, use_f16: bool) -> Tensor<B, 3> {
+impl AudioEncoder {
+    fn forward(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
         let [_, n_mels, _n_ctx] = x.dims();
 
         assert!(
@@ -701,10 +699,10 @@ pub struct ResidualEncoderAttentionBlockConfig {
 }
 
 impl ResidualEncoderAttentionBlockConfig {
-    pub fn init<B: Backend>(
+    pub fn init(
         &self,
-        tensor_device_ref: &B::Device,
-    ) -> ResidualEncoderAttentionBlock<B> {
+        tensor_device_ref: &Device,
+    ) -> ResidualEncoderAttentionBlock {
         let attn = MultiHeadAttentionConfig::new(self.n_state, self.n_head)
             .with_dropout(0.0)
             .init(tensor_device_ref);
@@ -722,11 +720,11 @@ impl ResidualEncoderAttentionBlockConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct ResidualEncoderAttentionBlock<B: Backend> {
-    pub attn: MultiHeadAttention<B>,
-    attn_ln: nn::LayerNorm<B>,
-    mlp: MLP<B>,
-    mlp_ln: nn::LayerNorm<B>,
+pub struct ResidualEncoderAttentionBlock {
+    pub attn: MultiHeadAttention,
+    attn_ln: nn::LayerNorm,
+    mlp: MLP,
+    mlp_ln: nn::LayerNorm,
 }
 
 /// Number of query positions to process at once in chunked encoder attention.
@@ -735,8 +733,8 @@ pub struct ResidualEncoderAttentionBlock<B: Backend> {
 /// 1500×1500 = 2.25M to 256×1500 = 384K entries per head (~6× reduction).
 const ENCODER_ATTN_CHUNK: usize = 256;
 
-impl<B: CustomKernelsBackend> ResidualEncoderAttentionBlock<B> {
-    fn forward(&self, x: Tensor<B, 3>, use_f16: bool) -> Tensor<B, 3> {
+impl ResidualEncoderAttentionBlock {
+    fn forward(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
         let ln_out = layer_norm_mixed(&self.attn_ln, x.clone(), use_f16);
         let attn_out = self.chunked_self_attention(ln_out, use_f16);
 
@@ -748,7 +746,7 @@ impl<B: CustomKernelsBackend> ResidualEncoderAttentionBlock<B> {
 
     /// Chunked self-attention: processes queries in blocks of ENCODER_ATTN_CHUNK
     /// to avoid allocating the full [batch, heads, seq, seq] score matrix.
-    fn chunked_self_attention(&self, x: Tensor<B, 3>, use_f16: bool) -> Tensor<B, 3> {
+    fn chunked_self_attention(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
         let mha = &self.attn;
         let [batch, seq_len, d_model] = x.dims();
         let n_heads = mha.n_heads;
@@ -786,7 +784,7 @@ impl<B: CustomKernelsBackend> ResidualEncoderAttentionBlock<B> {
 
         // Chunked: process query blocks against full K, V
         let n_chunks = (seq_len + ENCODER_ATTN_CHUNK - 1) / ENCODER_ATTN_CHUNK;
-        let mut chunk_outputs: Vec<Tensor<B, 4>> = Vec::with_capacity(n_chunks);
+        let mut chunk_outputs: Vec<Tensor<4>> = Vec::with_capacity(n_chunks);
 
         for chunk_idx in 0..n_chunks {
             let q_start = chunk_idx * ENCODER_ATTN_CHUNK;
@@ -820,10 +818,10 @@ pub struct ResidualDecoderAttentionBlockConfig {
 }
 
 impl ResidualDecoderAttentionBlockConfig {
-    pub fn init<B: Backend>(
+    pub fn init(
         &self,
-        tensor_device_ref: &B::Device,
-    ) -> ResidualDecoderAttentionBlock<B> {
+        tensor_device_ref: &Device,
+    ) -> ResidualDecoderAttentionBlock {
         let attn = MultiHeadAttentionConfig::new(self.n_state, self.n_head)
             .with_dropout(0.0)
             .init(tensor_device_ref);
@@ -849,17 +847,17 @@ impl ResidualDecoderAttentionBlockConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct ResidualDecoderAttentionBlock<B: Backend> {
-    pub attn: MultiHeadAttention<B>,
-    attn_ln: nn::LayerNorm<B>,
-    pub cross_attn: MultiHeadAttention<B>,
-    cross_attn_ln: nn::LayerNorm<B>,
-    mlp: MLP<B>,
-    mlp_ln: nn::LayerNorm<B>,
+pub struct ResidualDecoderAttentionBlock {
+    pub attn: MultiHeadAttention,
+    attn_ln: nn::LayerNorm,
+    pub cross_attn: MultiHeadAttention,
+    cross_attn_ln: nn::LayerNorm,
+    mlp: MLP,
+    mlp_ln: nn::LayerNorm,
 }
 
-impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
-    fn forward(&self, x: Tensor<B, 3>, xa: Tensor<B, 3>, mask: Tensor<B, 3, Bool>) -> Tensor<B, 3> {
+impl ResidualDecoderAttentionBlock {
+    fn forward(&self, x: Tensor<3>, xa: Tensor<3>, mask: Tensor<3, Bool>) -> Tensor<3> {
         let self_attn_out = self
             .attn
             .forward(MhaInput::self_attn(self.attn_ln.forward(x.clone())).mask_attn(mask))
@@ -878,10 +876,10 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
 
     fn forward_with_cross_attention(
         &self,
-        x: Tensor<B, 3>,
-        xa: Tensor<B, 3>,
-        mask: Tensor<B, 3, Bool>,
-    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+        x: Tensor<3>,
+        xa: Tensor<3>,
+        mask: Tensor<3, Bool>,
+    ) -> (Tensor<3>, Tensor<4>) {
         let self_attn_out = self
             .attn
             .forward(MhaInput::self_attn(self.attn_ln.forward(x.clone())).mask_attn(mask))
@@ -901,7 +899,7 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
     }
 
     /// Build pre-projected cross-attention KV cache in 4D head-split format.
-    fn build_cross_cache(&self, xa: Tensor<B, 3>, use_f16: bool) -> DecoderCrossAttentionCache<B> {
+    fn build_cross_cache(&self, xa: Tensor<3>, use_f16: bool) -> DecoderCrossAttentionCache {
         // Cross-attn weights are f32 for accuracy; project in f32, then cast cache to f16
         let [batch, seq, _] = xa.dims();
         let n_heads = self.cross_attn.n_heads;
@@ -934,12 +932,12 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
 
     fn forward_cached_with_cross_attention(
         &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 3, Bool>>,
-        cache: DecoderLayerCache<B>,
+        x: Tensor<3>,
+        mask: Option<Tensor<3, Bool>>,
+        cache: DecoderLayerCache,
         use_f16: bool,
-        fused_qkv: Option<&(Tensor<B, 2>, Tensor<B, 1>)>,
-    ) -> DecoderBlockCachedOutput<B> {
+        fused_qkv: Option<&(Tensor<2>, Tensor<1>)>,
+    ) -> DecoderBlockCachedOutput {
         let ln_out = layer_norm_mixed(&self.attn_ln, x.clone(), use_f16);
         let (self_attn_output, self_attention) =
             self.cached_self_attention(ln_out, mask, cache.self_attention, use_f16, fused_qkv);
@@ -966,12 +964,12 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
     /// Self-attention with KV cache in 4D head-split format.
     fn cached_self_attention(
         &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 3, Bool>>,
-        cache: DecoderSelfAttentionCache<B>,
+        x: Tensor<3>,
+        mask: Option<Tensor<3, Bool>>,
+        cache: DecoderSelfAttentionCache,
         use_f16: bool,
-        fused_qkv: Option<&(Tensor<B, 2>, Tensor<B, 1>)>,
-    ) -> (Tensor<B, 3>, DecoderSelfAttentionCache<B>) {
+        fused_qkv: Option<&(Tensor<2>, Tensor<1>)>,
+    ) -> (Tensor<3>, DecoderSelfAttentionCache) {
         let [batch_size, seq_len, _] = x.dims();
         let n_heads = self.attn.n_heads;
         let d_k = self.attn.d_k;
@@ -1038,7 +1036,7 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
         // For single-query decoding, use fused attention kernel
         // (Q@K^T·scale → softmax → @V in one pass, no intermediate tensors)
         let context = if seq_len == 1 && mask.is_none() {
-            fused_single_query_attn::<B>(q, k.clone(), v.clone())
+            fused_single_query_attn(q, k.clone(), v.clone())
                 .swap_dims(1, 2)
                 .reshape([batch_size, 1, n_heads * d_k])
         } else {
@@ -1075,10 +1073,10 @@ impl<B: CustomKernelsBackend> ResidualDecoderAttentionBlock<B> {
     /// Cross-attention using pre-computed KV cache (4D head-split).
     fn cached_cross_attention(
         &self,
-        x: Tensor<B, 3>,
-        cache: DecoderCrossAttentionCache<B>,
+        x: Tensor<3>,
+        cache: DecoderCrossAttentionCache,
         use_f16: bool,
-    ) -> (Tensor<B, 3>, Tensor<B, 4>, DecoderCrossAttentionCache<B>) {
+    ) -> (Tensor<3>, Tensor<4>, DecoderCrossAttentionCache) {
         let [batch_size, seq_len, _] = x.dims();
         let n_heads = self.cross_attn.n_heads;
         let d_k = self.cross_attn.d_k;
@@ -1126,7 +1124,7 @@ pub struct MLPConfig {
 }
 
 impl MLPConfig {
-    pub fn init<B: Backend>(&self, tensor_device_ref: &B::Device) -> MLP<B> {
+    pub fn init(&self, tensor_device_ref: &Device) -> MLP {
         let lin1 = nn::LinearConfig::new(self.n_state, 4 * self.n_state).init(tensor_device_ref);
         let gelu = nn::Gelu::new();
         let lin2 = nn::LinearConfig::new(4 * self.n_state, self.n_state).init(tensor_device_ref);
@@ -1136,14 +1134,14 @@ impl MLPConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct MLP<B: Backend> {
-    lin1: nn::Linear<B>,
+pub struct MLP {
+    lin1: nn::Linear,
     gelu: nn::Gelu,
-    lin2: nn::Linear<B>,
+    lin2: nn::Linear,
 }
 
-impl<B: Backend> MLP<B> {
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl MLP {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.lin1.forward(x);
         let x = self.gelu.forward(x);
 
@@ -1153,11 +1151,12 @@ impl<B: Backend> MLP<B> {
 
 /// Generate a Bool causal mask [1, seq_len, n_past + seq_len].
 /// `true` = masked (future positions blocked), `false` = attend.
-fn causal_mask<B: Backend>(
+fn causal_mask(
     seq_len: usize,
     n_past: usize,
-    device: &B::Device,
-) -> Tensor<B, 3, Bool> {
+    device: &Device,
+) -> Tensor<3, Bool> {
     let total = n_past + seq_len;
-    Tensor::<B, 2, Bool>::tril_mask([seq_len, total], n_past as i64, device).unsqueeze::<3>()
+    Tensor::<2, Bool>::tril_mask([seq_len, total], n_past as i64, device).unsqueeze::<3>()
 }
+

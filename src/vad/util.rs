@@ -245,12 +245,9 @@ pub fn merge_vad_segments(
         .collect()
 }
 
-pub fn detect_speech_regions<
-    B: crate::custom_kernels::CustomKernelsBackend,
-    F: FnMut(usize, usize) -> bool,
->(
-    vad: &SileroVAD6Model<B>,
-    device: &B::Device,
+pub fn detect_speech_regions<F: FnMut(usize, usize) -> bool>(
+    vad: &SileroVAD6Model,
+    device: &burn::tensor::Device,
     waveform: &[f32],
     mut progress_callback: Option<F>,
 ) -> Result<Vec<SpeechRegion>, String> {
@@ -273,7 +270,7 @@ pub fn detect_speech_regions<
         let mut block = vec![0.0f32; padded_block_len];
         block[..block_len].copy_from_slice(&waveform[offset..block_end]);
 
-        let block_tensor = Tensor::<B, 1>::from_floats(block.as_slice(), device)
+        let block_tensor = Tensor::<1>::from_floats(block.as_slice(), device)
             .reshape([num_windows, chunk_size]);
         let (new_state, output) = vad
             .predict_sequence(predict_state, block_tensor)
