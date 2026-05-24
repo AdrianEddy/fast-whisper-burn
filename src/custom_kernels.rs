@@ -6,7 +6,15 @@
 //! - Linear (matvec): reads f16 input + f32 weights, computes in f32, writes f16
 //! - Single-query attention: fused Q@K^T·scale→softmax→@V for seq_len=1 decoding
 
-use burn::backend::{Dispatch, Wgpu, backend_extension};
+use burn::backend::{Dispatch, backend_extension};
+#[cfg(any(feature = "wgpu", feature = "webgpu"))]
+use burn::backend::Wgpu;
+#[cfg(feature = "vulkan")]
+use burn::backend::Vulkan;
+#[cfg(feature = "metal")]
+use burn::backend::Metal;
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
 use burn::nn;
 use burn::tensor::Tensor as BurnTensor;
 use burn_backend::DType;
@@ -702,7 +710,12 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
 // ===========================================================================
 
 /// Backend extension for fused f16 mixed-precision kernels.
-#[backend_extension(Wgpu)]
+#[backend_extension(
+    Wgpu: cfg(any(feature = "wgpu", feature = "webgpu")),
+    Vulkan: cfg(feature = "vulkan"),
+    Metal: cfg(feature = "metal"),
+    Cuda: cfg(feature = "cuda"),
+)]
 pub trait CustomKernelsBackend: burn::backend::Backend {
     fn layer_norm_f16(
         input: FloatTensor<Self>,

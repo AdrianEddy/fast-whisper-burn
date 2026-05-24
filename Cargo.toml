@@ -11,7 +11,7 @@ edition = "2024"
 #burn-ir      = { version = "0.21" }
 #burn-backend = { version = "0.21" }
 #cubecl       = { version = "0.10.0", features = ["stdlib"] }
-burn         = { git = "https://github.com/tracel-ai/burn", rev = "0034f64bf0827b1156057c7b09ba4f093a77bfa4", features = ["wgpu", "autotune", "fusion", "flex", "extension"] }
+burn         = { git = "https://github.com/tracel-ai/burn", rev = "0034f64bf0827b1156057c7b09ba4f093a77bfa4", features = ["autotune", "fusion", "flex", "extension"] }
 burn-store   = { git = "https://github.com/tracel-ai/burn", rev = "0034f64bf0827b1156057c7b09ba4f093a77bfa4", features = ["burnpack", "pytorch"] }
 burn-cubecl  = { git = "https://github.com/tracel-ai/burn", rev = "0034f64bf0827b1156057c7b09ba4f093a77bfa4" }
 burn-fusion  = { git = "https://github.com/tracel-ai/burn", rev = "0034f64bf0827b1156057c7b09ba4f093a77bfa4" }
@@ -27,3 +27,11 @@ strum_macros = "0.28.0"
 log = "0.4"
 mt19937 = "3.3.0"
 simplelog = "0.12"
+
+[features]
+default = ["wgpu"]
+wgpu   = ["burn/wgpu"]
+metal  = ["burn/metal"]
+vulkan = ["burn/vulkan"]
+webgpu = ["burn/webgpu"]
+cuda   = ["burn/cuda"]
