@@ -22,7 +22,7 @@ use burn_backend::TensorMetadata;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::tensor::CubeTensor;
-use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
+use burn_cubecl::{CubeBackend, CubeRuntime};
 use cubecl::prelude::*;
 use cubecl::{CubeCount, CubeDim};
 
@@ -52,7 +52,7 @@ fn layer_norm_f16_kernel<FIn: Float, FComp: Float>(
     let row_offset = (row * d_model) as usize;
     let tid_idx = tid as usize;
 
-    let mut shared = SharedMemory::<FComp>::new(BLOCK_SIZE as usize);
+    let mut shared = Shared::<[FComp]>::new_slice(BLOCK_SIZE as usize);
 
     // --- Pass 1: compute mean via parallel reduction ---
     let mut local_sum = FComp::new(0.0);
@@ -129,7 +129,7 @@ fn softmax_f16_kernel<FIn: Float, FComp: Float>(
     let row_offset = (row * row_size) as usize;
     let tid_idx = tid as usize;
 
-    let mut shared = SharedMemory::<FComp>::new(BLOCK_SIZE as usize);
+    let mut shared = Shared::<[FComp]>::new_slice(BLOCK_SIZE as usize);
 
     // --- Pass 1: find max via parallel reduction ---
     let mut local_max = FComp::new(-65504.0);
@@ -213,7 +213,7 @@ fn linear_f16_kernel<FIn: Float, FComp: Float>(
     let input_offset = (row * d_in) as usize;
     let weight_offset = (col * d_in) as usize;
 
-    let mut shared = SharedMemory::<FComp>::new(BLOCK_SIZE as usize);
+    let mut shared = Shared::<[FComp]>::new_slice(BLOCK_SIZE as usize);
 
     // Parallel dot product: input[row, :] . weight[col, :]
     let mut local_sum = FComp::new(0.0);
@@ -264,7 +264,7 @@ fn lstm_cell_kernel<F: Float>(
         let k_idx = k as usize;
 
         // Load hidden into shared memory for all threads to read
-        let mut shared_h = SharedMemory::<F>::new(BLOCK_SIZE as usize);
+        let mut shared_h = Shared::<[F]>::new_slice(BLOCK_SIZE as usize);
         shared_h[k_idx] = hidden[k_idx];
         sync_cube();
 
@@ -361,12 +361,12 @@ fn fused_single_query_attn_kernel<FIn: Float, FComp: Float>(
     let lane = tid % d_k;
 
     // Shared memory
-    let mut q_shared = SharedMemory::<FComp>::new(ATTN_D_K_MAX as usize);
+    let mut q_shared = Shared::<[FComp]>::new_slice(ATTN_D_K_MAX as usize);
     // partial_out[stripe * d_k + lane]: per-stripe rescaled weighted V accumulator
-    let mut partial_out = SharedMemory::<FComp>::new(ATTN_SMEM_PARTIALS as usize);
+    let mut partial_out = Shared::<[FComp]>::new_slice(ATTN_SMEM_PARTIALS as usize);
     // Per-stripe max and sum (one per stripe, written by lane 0)
-    let mut stripe_max_s = SharedMemory::<FComp>::new(ATTN_N_STRIPES_MAX as usize);
-    let mut stripe_sum_s = SharedMemory::<FComp>::new(ATTN_N_STRIPES_MAX as usize);
+    let mut stripe_max_s = Shared::<[FComp]>::new_slice(ATTN_N_STRIPES_MAX as usize);
+    let mut stripe_sum_s = Shared::<[FComp]>::new_slice(ATTN_N_STRIPES_MAX as usize);
 
     // Load Q into shared memory
     if tid < d_k {
@@ -751,12 +751,9 @@ pub trait CustomKernelsBackend: burn::backend::Backend {
 }
 
 // Impl for CubeBackend (non-fusion). Wraps backends that are just CubeBackend without Fusion.
-impl<R, F, I, BT> CustomKernelsBackend for CubeBackend<R, F, I, BT>
+impl<R> CustomKernelsBackend for CubeBackend<R>
 where
     R: CubeRuntime,
-    F: FloatElement,
-    I: IntElement,
-    BT: BoolElement,
 {
     fn layer_norm_f16(
         input: CubeTensor<R>,
