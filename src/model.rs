@@ -127,14 +127,15 @@ impl Whisper {
                     ],
                     1,
                 );
-                let b = Tensor::cat(
-                    vec![
-                        block.attn.query.bias.as_ref().unwrap().val(),
-                        block.attn.key.bias.as_ref().unwrap().val(),
-                        block.attn.value.bias.as_ref().unwrap().val(),
-                    ],
-                    0,
-                );
+                let q_bias = block.attn.query.bias.as_ref().unwrap().val();
+                let v_bias = block.attn.value.bias.as_ref().unwrap().val();
+                // Whisper's key projection has no bias (`with_key_bias(false)`), so
+                // substitute zeros for the key slice of the fused QKV bias.
+                let k_bias = match block.attn.key.bias.as_ref() {
+                    Some(bias) => bias.val(),
+                    None => q_bias.zeros_like(),
+                };
+                let b = Tensor::cat(vec![q_bias, k_bias, v_bias], 0);
                 (w, b)
             })
             .collect();
@@ -705,6 +706,7 @@ impl ResidualEncoderAttentionBlockConfig {
     ) -> ResidualEncoderAttentionBlock {
         let attn = MultiHeadAttentionConfig::new(self.n_state, self.n_head)
             .with_dropout(0.0)
+            .with_key_bias(false) // Whisper key projection has no bias
             .init(tensor_device_ref);
         let attn_ln = nn::LayerNormConfig::new(self.n_state).init(tensor_device_ref);
         let mlp = MLPConfig::new(self.n_state).init(tensor_device_ref);
@@ -824,11 +826,13 @@ impl ResidualDecoderAttentionBlockConfig {
     ) -> ResidualDecoderAttentionBlock {
         let attn = MultiHeadAttentionConfig::new(self.n_state, self.n_head)
             .with_dropout(0.0)
+            .with_key_bias(false) // Whisper key projection has no bias
             .init(tensor_device_ref);
         let attn_ln = nn::LayerNormConfig::new(self.n_state).init(tensor_device_ref);
 
         let cross_attn = MultiHeadAttentionConfig::new(self.n_state, self.n_head)
             .with_dropout(0.0)
+            .with_key_bias(false) // Whisper key projection has no bias
             .init(tensor_device_ref);
         let cross_attn_ln = nn::LayerNormConfig::new(self.n_state).init(tensor_device_ref);
 

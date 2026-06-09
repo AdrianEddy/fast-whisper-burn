@@ -1,15 +1,11 @@
-use burn::{backend::wgpu::Wgpu, config::Config};
+use burn::config::Config;
 use burn_store::pytorch::PytorchReader;
 use burn_store::{BurnpackStore, ModuleSnapshot, PytorchStore};
 use fast_whisper_burn::MixedPrecisionAdapter;
-use fast_whisper_burn::custom_kernels::CustomKernelsBackend;
 use fast_whisper_burn::model::*;
 use std::error::Error;
 
-fn save_whisper<B: CustomKernelsBackend>(
-    whisper: Whisper<B>,
-    name: &str,
-) -> Result<(), burn_store::BurnpackError> {
+fn save_whisper(whisper: Whisper, name: &str) -> Result<(), burn_store::BurnpackError> {
     let mut store = BurnpackStore::from_file(&format!("{name}.bpk")).overwrite(true);
     whisper.save_into(&mut store)?;
 
@@ -40,7 +36,7 @@ fn main() {
         .to_string();
 
     println!("Loading model from {pt_path}...");
-    let (whisper, whisper_config): (Whisper<Wgpu>, WhisperConfig) = match load_whisper(&pt_path) {
+    let (whisper, whisper_config): (Whisper, WhisperConfig) = match load_whisper(&pt_path) {
         Ok(model) => model,
         Err(e) => {
             eprintln!("Error loading model from {pt_path}: {e}");
@@ -69,9 +65,7 @@ fn main() {
 /// a `model_state_dict` top-level key containing the model weights.
 ///
 /// Config values are inferred from tensor shapes in the checkpoint.
-pub fn load_whisper<B: CustomKernelsBackend>(
-    pt_path: &str,
-) -> Result<(Whisper<B>, WhisperConfig), Box<dyn Error>> {
+pub fn load_whisper(pt_path: &str) -> Result<(Whisper, WhisperConfig), Box<dyn Error>> {
     // 1. Inspect the .pt file to infer model config from tensor shapes
     let reader = PytorchReader::with_top_level_key(pt_path, "model_state_dict")?;
 
@@ -133,7 +127,7 @@ pub fn load_whisper<B: CustomKernelsBackend>(
 
     // 2. Init model with random weights, then load from .pt
     let device = Default::default();
-    let mut whisper: Whisper<B> = config.init(&device);
+    let mut whisper: Whisper = config.init(&device);
 
     let mut store = PytorchStore::from_file(pt_path)
         .with_top_level_key("model_state_dict")
@@ -146,9 +140,7 @@ pub fn load_whisper<B: CustomKernelsBackend>(
         .with_key_remapping(
             r"^decoder\.token_embedding\.weight$",
             "decoder.token_embedding",
-        )
-        // Whisper uses bias=False for key projections, but Burn MHA always includes key bias
-        .allow_partial(true);
+        );
 
     let result = whisper.load_from(&mut store)?;
     println!("Loaded {} tensors from {pt_path}", result.applied.len());

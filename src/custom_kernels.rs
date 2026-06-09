@@ -19,6 +19,7 @@ use burn::nn;
 use burn::tensor::Tensor as BurnTensor;
 use burn_backend::DType;
 use burn_backend::TensorMetadata;
+use burn_backend::tensor::FloatTensor;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::tensor::CubeTensor;
