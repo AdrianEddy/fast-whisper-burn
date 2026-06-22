@@ -1091,11 +1091,11 @@ pub fn layer_norm_f16<const D: usize>(
     beta: BurnTensor<1>,
 ) -> BurnTensor<D> {
     let output = Dispatch::layer_norm_f16(
-        input.into_primitive(),
-        gamma.into_primitive(),
-        beta.into_primitive(),
+        input.into_dispatch(),
+        gamma.into_dispatch(),
+        beta.into_dispatch(),
     );
-    BurnTensor::from_primitive(output)
+    BurnTensor::from_dispatch(output)
 }
 
 /// Convenience: run LayerNorm, choosing the fused f16 kernel when `use_f16` is
@@ -1122,8 +1122,8 @@ pub fn layer_norm_mixed<const D: usize>(
 /// Fused Softmax for f16 tensors: reads f16, computes in f32, writes f16.
 /// Always operates on the last dimension.
 pub fn softmax_f16<const D: usize>(input: BurnTensor<D>) -> BurnTensor<D> {
-    let output = Dispatch::softmax_f16(input.into_primitive());
-    BurnTensor::from_primitive(output)
+    let output = Dispatch::softmax_f16(input.into_dispatch());
+    BurnTensor::from_dispatch(output)
 }
 
 /// Convenience: run softmax, choosing the fused f16 kernel when `use_f16` is
@@ -1152,11 +1152,11 @@ pub fn linear_f16<const D: usize>(
     let d_out = weight.dims()[0];
     let bias = bias.unwrap_or_else(|| BurnTensor::<1>::zeros([d_out], &device));
     let output = Dispatch::linear_f16(
-        input.into_primitive(),
-        weight.into_primitive(),
-        bias.into_primitive(),
+        input.into_dispatch(),
+        weight.into_dispatch(),
+        bias.into_dispatch(),
     );
-    BurnTensor::from_primitive(output)
+    BurnTensor::from_dispatch(output)
 }
 
 /// Convenience: run Linear, choosing the fused f16 kernel when `use_f16` is
@@ -1182,13 +1182,13 @@ pub fn lstm_cell_fused(
 ) -> (BurnTensor<2>, BurnTensor<2>) {
     let d_hidden = hidden.dims()[1];
     let output = Dispatch::lstm_cell_fused(
-        hidden.flatten::<1>(0, 1).into_primitive(),
-        cell.flatten::<1>(0, 1).into_primitive(),
-        input_gates.flatten::<1>(0, 1).into_primitive(),
-        weight.into_primitive(),
-        bias.into_primitive(),
+        hidden.flatten::<1>(0, 1).into_dispatch(),
+        cell.flatten::<1>(0, 1).into_dispatch(),
+        input_gates.flatten::<1>(0, 1).into_dispatch(),
+        weight.into_dispatch(),
+        bias.into_dispatch(),
     );
-    let combined: BurnTensor<1> = BurnTensor::from_primitive(output);
+    let combined: BurnTensor<1> = BurnTensor::from_dispatch(output);
     let new_hidden = combined.clone().slice([0..d_hidden]).reshape([1, d_hidden]);
     let new_cell = combined
         .slice([d_hidden..2 * d_hidden])
@@ -1202,10 +1202,10 @@ pub fn lstm_cell_fused(
 /// Returns context: [batch, n_heads, 1, d_k].
 pub fn fused_single_query_attn(q: BurnTensor<4>, k: BurnTensor<4>, v: BurnTensor<4>) -> BurnTensor<4> {
     let output = Dispatch::fused_single_query_attn(
-        q.into_primitive(),
-        k.into_primitive(),
-        v.into_primitive(),
+        q.into_dispatch(),
+        k.into_dispatch(),
+        v.into_dispatch(),
     );
-    BurnTensor::from_primitive(output)
+    BurnTensor::from_dispatch(output)
 }
 
