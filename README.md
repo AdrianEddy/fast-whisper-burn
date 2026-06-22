@@ -71,6 +71,8 @@ python3 python/convert_huggingface_model.py openai/whisper-base.en base.en.pt
 cargo run --release --bin convert base.en.pt
 ```
 
+Pre-converted models can be downloaded from [here](https://drive.google.com/drive/folders/1As4SicRsmse1-IPDfmlpqGWMsiK1zANv?usp=drive_link)
+
 ### 2. Prepare audio
 
 The input must be 16 kHz mono WAV:

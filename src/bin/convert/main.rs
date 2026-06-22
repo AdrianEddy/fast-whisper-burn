@@ -5,14 +5,15 @@ use fast_whisper_burn::MixedPrecisionAdapter;
 use fast_whisper_burn::model::*;
 use std::error::Error;
 
-fn save_whisper(whisper: Whisper, name: &str) -> Result<(), burn_store::BurnpackError> {
+fn save_whisper(whisper: Whisper, name: &str) -> Result<(), Box<dyn Error>> {
     let mut store = BurnpackStore::from_file(&format!("{name}.bpk")).overwrite(true);
     whisper.save_into(&mut store)?;
 
     let mut storef16 = BurnpackStore::from_file(&format!("{name}-f16.bpk"))
         .overwrite(true)
         .with_to_adapter(MixedPrecisionAdapter(burn::tensor::DType::F16));
-    whisper.save_into(&mut storef16)
+    whisper.save_into(&mut storef16)?;
+    Ok(())
 }
 
 use std::env;
