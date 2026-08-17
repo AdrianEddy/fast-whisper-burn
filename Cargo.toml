@@ -11,7 +11,7 @@ edition = "2024"
 #burn-ir      = { version = "0.22.0-pre.1" }
 #burn-backend = { version = "0.22.0-pre.1" }
 #cubecl       = { version = "0.11.0-pre.1", features = ["stdlib"] }
-burn         = { git = "https://github.com/tracel-ai/burn", rev = "b6e27bd", features = ["autotune", "fusion", "flex", "extension"] }
+burn         = { git = "https://github.com/tracel-ai/burn", rev = "b6e27bd", default-features = false, features = ["std", "autotune", "fusion", "flex", "extension"] }
 burn-store   = { git = "https://github.com/tracel-ai/burn", rev = "b6e27bd", features = ["burnpack", "pytorch"] }
 burn-cubecl  = { git = "https://github.com/tracel-ai/burn", rev = "b6e27bd" }
 burn-fusion  = { git = "https://github.com/tracel-ai/burn", rev = "b6e27bd" }
