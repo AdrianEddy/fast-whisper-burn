@@ -490,11 +490,7 @@ fn launch_layer_norm_f16<R: CubeRuntime>(
         input.dtype,
     );
 
-    let cube_dim = CubeDim {
-        x: BLOCK_SIZE,
-        y: 1,
-        z: 1,
-    };
+    let cube_dim = CubeDim::new_1d(BLOCK_SIZE);
     let cube_count = CubeCount::Static(total_rows as u32, 1, 1);
 
     layer_norm_f16_kernel::launch::<half::f16, f32, R>(
@@ -527,11 +523,7 @@ fn launch_softmax_f16<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
         input.dtype,
     );
 
-    let cube_dim = CubeDim {
-        x: BLOCK_SIZE,
-        y: 1,
-        z: 1,
-    };
+    let cube_dim = CubeDim::new_1d(BLOCK_SIZE);
     let cube_count = CubeCount::Static(total_rows as u32, 1, 1);
 
     softmax_f16_kernel::launch::<half::f16, f32, R>(
@@ -568,11 +560,7 @@ fn launch_linear_f16<R: CubeRuntime>(
 
     let output = empty_device_dtype(client.clone(), input.device.clone(), out_shape, input.dtype);
 
-    let cube_dim = CubeDim {
-        x: BLOCK_SIZE,
-        y: 1,
-        z: 1,
-    };
+    let cube_dim = CubeDim::new_1d(BLOCK_SIZE);
     let cube_count = CubeCount::Static((total_rows * d_out) as u32, 1, 1);
 
     linear_f16_kernel::launch::<half::f16, f32, R>(
@@ -614,11 +602,7 @@ fn launch_lstm_cell_fused<R: CubeRuntime>(
         hidden.dtype,
     );
 
-    let cube_dim = CubeDim {
-        x: d_hidden as u32,
-        y: 1,
-        z: 1,
-    };
+    let cube_dim = CubeDim::new_1d(d_hidden as u32);
     let cube_count = CubeCount::Static(1, 1, 1);
 
     lstm_cell_kernel::launch::<f32, R>(
@@ -665,11 +649,7 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
     let client = q.client.clone();
     let output = empty_device_dtype(client.clone(), q.device.clone(), q.shape().clone(), q.dtype);
 
-    let cube_dim = CubeDim {
-        x: threads_per_cube as u32,
-        y: 1,
-        z: 1,
-    };
+    let cube_dim = CubeDim::new_1d(threads_per_cube as u32);
     let cube_count = CubeCount::Static(n_cubes as u32, 1, 1);
 
     match q.dtype {
