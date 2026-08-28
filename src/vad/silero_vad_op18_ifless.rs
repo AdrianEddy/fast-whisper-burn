@@ -10,7 +10,7 @@ use burn::tensor::Bytes;
 use burn_store::BurnpackStore;
 use burn_store::ModuleSnapshot;
 
-use crate::custom_kernels::lstm_cell_fused;
+use crate::custom_kernels::lstm_sequence_fused;
 
 #[derive(Module, Debug)]
 pub struct Model {
@@ -130,28 +130,25 @@ impl Model {
             .expect("linear13 must have bias")
             .val();
 
-        let mut hidden_states = Vec::with_capacity(steps);
-
-        for step in 0..steps {
-            let input_gates = input_gates_all
-                .clone()
-                .slice(s![step as i64..step as i64 + 1, ..]);
-
-            let (new_hidden, new_cell) = lstm_cell_fused(
-                hidden,
-                cell,
-                input_gates,
-                lstm_weight.clone(),
-                lstm_bias.clone(),
-            );
-            hidden = new_hidden;
-            cell = new_cell;
-            hidden_states.push(hidden.clone());
-        }
+        // One dispatch for the whole recurrence. This used to be a `for step in 0..steps` loop
+        // around `lstm_cell_fused`, which cost `steps` dispatches plus a gate slice and two
+        // result slices each — ~1000 launches per 8.2 s of audio, all of them a single 128-thread
+        // cube, all of them dependent. That made the VAD purely launch-latency-bound and so
+        // fragile under a shared GPU that one competing thread cost it 15x and three cost it 49x.
+        let (all_hidden, last_cell) = lstm_sequence_fused(
+            hidden,
+            cell,
+            input_gates_all,
+            lstm_weight,
+            lstm_bias,
+        ); // [steps, 128], [1, 128]
+        hidden = all_hidden
+            .clone()
+            .slice(s![steps as i64 - 1..steps as i64, ..]);
+        cell = last_cell;
 
         // Batch output head: process all hidden states at once instead of
         // per-step (eliminates N × (relu + conv1d + sigmoid) kernel launches).
-        let all_hidden = burn::tensor::Tensor::cat(hidden_states, 0); // [steps, 128]
         let output = burn::tensor::activation::relu(all_hidden);
         let output: Tensor<3> = output.unsqueeze_dims::<3>(&[-1]); // [steps, 128, 1]
         let output = self.conv1d42.forward(output); // [steps, 1, 1]

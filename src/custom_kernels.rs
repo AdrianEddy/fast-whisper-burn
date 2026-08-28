@@ -332,6 +332,129 @@ fn lstm_cell_kernel<F: Float>(
     }
 }
 
+/// Fused LSTM over a whole sequence: the recurrence runs *inside* one dispatch.
+///
+/// `lstm_cell_kernel` above computes one timestep, so a `steps`-long sequence costs `steps`
+/// dispatches — plus, on the host side, a slice of the gate matrix and two slices of the packed
+/// result per step. That is a single cube of `d_hidden` threads either way: 128 threads out of a
+/// modern GPU's tens of thousands, dominated entirely by launch latency rather than by the ~512
+/// multiply-adds each lane actually performs. Measured on an RTX 5090, a step costs ~100 us
+/// wall-clock on an *idle* device, and Silero's VAD needs ~31 of them per second of audio, each
+/// depending on the one before. Any other work sharing the queue is therefore paid in full, once
+/// per step: one competing thread made the VAD 15x slower, three made it 49x slower.
+///
+/// The recurrence cannot be parallelised, but it does not have to be re-dispatched. `h` lives in
+/// shared memory (it already did — every lane needs every element for the gate dot products) and
+/// `c` in a register, so the loop simply stays on the GPU. The weight matrix also stops being
+/// re-fetched per dispatch and just stays hot in cache. `steps` dispatches become one.
+///
+/// Output is packed like `lstm_cell_kernel`'s: rows `0..steps` are the hidden state at each step,
+/// and row `steps` is the final cell state. The final *hidden* state needs no row of its own —
+/// it is row `steps - 1`.
+#[cube(launch)]
+fn lstm_sequence_kernel<F: Float>(
+    state: &Tensor<F>,       // [2 * d_hidden] flat: [hidden | cell]
+    input_gates: &Tensor<F>, // [steps, 4*d_hidden] flat
+    weight: &Tensor<F>,      // [d_hidden, 4*d_hidden] row-major
+    bias: &Tensor<F>,        // [4*d_hidden] flat
+    output: &mut Tensor<F>,  // [(steps + 1) * d_hidden] flat: [hidden per step | final cell]
+    d_hidden: u32,
+    steps: u32,
+) {
+    let k = UNIT_POS_X;
+    // Uniformly true: the launch sets `cube_dim` to exactly `d_hidden`. It has to be, because the
+    // `sync_cube()`s below are inside it.
+    if k < d_hidden {
+        let k_idx = k as usize;
+
+        let dh = d_hidden;
+        let d_out = dh + dh + dh + dh;
+        let idx0 = k; // gate i
+        let idx1 = dh + k; // gate f
+        let idx2 = dh + dh + k; // gate g
+        let idx3 = dh + dh + dh + k; // gate o
+
+        let b0 = bias[idx0 as usize];
+        let b1 = bias[idx1 as usize];
+        let b2 = bias[idx2 as usize];
+        let b3 = bias[idx3 as usize];
+
+        let one = F::new(1.0);
+        let zero = F::new(0.0);
+        let two = F::new(2.0);
+        let ten = F::new(10.0);
+
+        // `h` is kept in shared memory because every lane reads every element of it; `c` is
+        // per-lane and stays in a register for the whole sequence.
+        let mut shared_h = Shared::<[F]>::new_slice(BLOCK_SIZE as usize);
+        let mut h = state[k_idx];
+        let mut c = state[(dh + k) as usize];
+        shared_h[k_idx] = h;
+
+        let mut step = 0u32;
+        while step < steps {
+            // Every lane's write of h_{t-1} is visible from here.
+            sync_cube();
+
+            let gate_base = step * d_out;
+            let mut g0 = b0 + input_gates[(gate_base + idx0) as usize];
+            let mut g1 = b1 + input_gates[(gate_base + idx1) as usize];
+            let mut g2 = b2 + input_gates[(gate_base + idx2) as usize];
+            let mut g3 = b3 + input_gates[(gate_base + idx3) as usize];
+
+            let mut j = 0u32;
+            while j < dh {
+                let h_j = shared_h[j as usize];
+                let wrow = j * d_out; // weight[j, :] starts at j * d_out
+                g0 += h_j * weight[(wrow + idx0) as usize];
+                g1 += h_j * weight[(wrow + idx1) as usize];
+                g2 += h_j * weight[(wrow + idx2) as usize];
+                g3 += h_j * weight[(wrow + idx3) as usize];
+                j += 1u32;
+            }
+
+            // Gate activations: sigmoid(i), sigmoid(f), tanh(g), sigmoid(o)
+            let sig_i = one / (one + F::exp(zero - g0));
+            let sig_f = one / (one + F::exp(zero - g1));
+            let sig_o = one / (one + F::exp(zero - g3));
+            // Numerically stable tanh: clamp to avoid exp overflow
+            let tanh_g = if g2 > ten {
+                one
+            } else if g2 < zero - ten {
+                zero - one
+            } else {
+                let exp2g = F::exp(two * g2);
+                (exp2g - one) / (exp2g + one)
+            };
+
+            let new_c = sig_f * c + sig_i * tanh_g;
+
+            let tanh_c = if new_c > ten {
+                one
+            } else if new_c < zero - ten {
+                zero - one
+            } else {
+                let exp2c = F::exp(two * new_c);
+                (exp2c - one) / (exp2c + one)
+            };
+            let new_h = sig_o * tanh_c;
+
+            output[(step * dh + k) as usize] = new_h;
+            h = new_h;
+            c = new_c;
+
+            // Nobody may overwrite h_{t-1} until every lane has finished reading it.
+            sync_cube();
+            shared_h[k_idx] = h;
+
+            step += 1u32;
+        }
+
+        // Row `steps` is the final cell state; the final hidden state is row `steps - 1`.
+        output[(steps * dh + k) as usize] = c;
+    }
+}
+
 /// Fused single-query attention: Q@K^T · scale → softmax → @V in one kernel.
 /// One cube per (batch, head) pair. d_k threads per cube, one per output dimension.
 /// Fused single-query attention with striped n_kv parallelism.
@@ -621,6 +744,48 @@ fn launch_lstm_cell_fused<R: CubeRuntime>(
     output
 }
 
+fn launch_lstm_sequence_fused<R: CubeRuntime>(
+    state: CubeTensor<R>,
+    input_gates: CubeTensor<R>,
+    weight: CubeTensor<R>,
+    bias: CubeTensor<R>,
+) -> CubeTensor<R> {
+    let state = into_contiguous(state);
+    let input_gates = into_contiguous(input_gates);
+    let weight = into_contiguous(weight);
+    let bias = into_contiguous(bias);
+
+    let d_hidden = state.shape().iter().product::<usize>() / 2;
+    let steps = input_gates.shape().iter().product::<usize>() / (4 * d_hidden);
+    let client = state.client.clone();
+
+    let out_shape = burn_backend::Shape::from(vec![(steps + 1) * d_hidden]);
+    let output = empty_device_dtype(
+        client.clone(),
+        state.device.clone(),
+        out_shape,
+        state.dtype,
+    );
+
+    let cube_dim = CubeDim::new_1d(d_hidden as u32);
+    let cube_count = CubeCount::Static(1, 1, 1);
+
+    lstm_sequence_kernel::launch::<f32, R>(
+        &client,
+        cube_count,
+        cube_dim,
+        state.into_tensor_arg(),
+        input_gates.into_tensor_arg(),
+        weight.into_tensor_arg(),
+        bias.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        d_hidden as u32,
+        steps as u32,
+    );
+
+    output
+}
+
 fn launch_fused_single_query_attn<R: CubeRuntime>(
     q: CubeTensor<R>, // [batch, n_heads, 1, d_k]
     k: CubeTensor<R>, // [batch, n_heads, n_kv, d_k]
@@ -722,6 +887,15 @@ pub trait CustomKernelsBackend: burn::backend::Backend {
         bias: FloatTensor<Self>,
     ) -> FloatTensor<Self>;
 
+    /// Fused LSTM over a whole sequence: `steps` timesteps in ONE dispatch, instead of one
+    /// dispatch per step. Returns [hidden per step | final cell], `(steps + 1) * d_hidden` long.
+    fn lstm_sequence_fused(
+        state: FloatTensor<Self>,
+        input_gates: FloatTensor<Self>,
+        weight: FloatTensor<Self>,
+        bias: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
     /// Fused single-query attention: Q@K^T·scale → softmax → @V in one kernel.
     /// All inputs are 4D [batch, n_heads, seq/n_kv, d_k]. Q has seq=1.
     fn fused_single_query_attn(
@@ -764,6 +938,15 @@ where
         bias: CubeTensor<R>,
     ) -> CubeTensor<R> {
         launch_lstm_cell_fused(hidden, cell, input_gates, weight, bias)
+    }
+
+    fn lstm_sequence_fused(
+        state: CubeTensor<R>,
+        input_gates: CubeTensor<R>,
+        weight: CubeTensor<R>,
+        bias: CubeTensor<R>,
+    ) -> CubeTensor<R> {
+        launch_lstm_sequence_fused(state, input_gates, weight, bias)
     }
 
     fn fused_single_query_attn(
@@ -935,6 +1118,68 @@ mod fusion_impl {
                     streams,
                     OperationIr::Custom(desc.clone()),
                     LinearF16Op::<B> {
+                        desc,
+                        _b: PhantomData,
+                    },
+                )
+                .output()
+        }
+
+        fn lstm_sequence_fused(
+            state: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            input_gates: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            weight: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+            bias: <Self as burn_backend::BackendTypes>::FloatTensorPrimitive,
+        ) -> <Self as burn_backend::BackendTypes>::FloatTensorPrimitive {
+            let client = state.client.clone();
+            let out_dtype = state.dtype;
+            let d_hidden: usize = state.shape.iter().product::<usize>() / 2;
+            let steps: usize = input_gates.shape.iter().product::<usize>() / (4 * d_hidden);
+            let out_shape = vec![(steps + 1) * d_hidden].into();
+
+            #[derive(Clone, Debug)]
+            struct LstmSeqOp<B1> {
+                desc: CustomOpIr,
+                _b: PhantomData<B1>,
+            }
+
+            impl<B1: FusionBackend + CustomKernelsBackend> Operation<B1::FusionRuntime> for LstmSeqOp<B1> {
+                fn execute(
+                    &self,
+                    handles: &mut HandleContainer<
+                        <B1::FusionRuntime as FusionRuntime>::FusionHandle,
+                    >,
+                ) {
+                    let ([state, input_gates, weight, bias], [output]) =
+                        self.desc.as_fixed::<4, 1>();
+                    let state = handles.get_float_tensor::<B1>(state);
+                    let input_gates = handles.get_float_tensor::<B1>(input_gates);
+                    let weight = handles.get_float_tensor::<B1>(weight);
+                    let bias = handles.get_float_tensor::<B1>(bias);
+                    let result = B1::lstm_sequence_fused(state, input_gates, weight, bias);
+                    handles.register_float_tensor::<B1>(&output.id, result);
+                }
+            }
+
+            let streams = StreamId::current();
+            let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, out_dtype);
+
+            let desc = CustomOpIr::new(
+                "lstm_sequence_fused",
+                &[
+                    state.into_ir(),
+                    input_gates.into_ir(),
+                    weight.into_ir(),
+                    bias.into_ir(),
+                ],
+                &[out_ir],
+            );
+
+            client
+                .register(
+                    streams,
+                    OperationIr::Custom(desc.clone()),
+                    LstmSeqOp::<B> {
                         desc,
                         _b: PhantomData,
                     },
@@ -1174,6 +1419,44 @@ pub fn lstm_cell_fused(
         .slice([d_hidden..2 * d_hidden])
         .reshape([1, d_hidden]);
     (new_hidden, new_cell)
+}
+
+/// Fused LSTM over a whole sequence: `steps` timesteps in ONE dispatch.
+///
+/// The drop-in replacement for looping [`lstm_cell_fused`] over the time axis. Takes the gate
+/// projections for every step at once (`[steps, 4*d_hidden]`, which is exactly what one batched
+/// `Linear` over the features already produces) and returns the hidden state at every step plus
+/// the final cell state. The final hidden state is the last row of `all_hidden`.
+///
+/// A `steps`-long sequence used to cost `steps` dispatches plus a host-side slice per step; this
+/// costs one. See [`lstm_sequence_kernel`] for why that is the whole difference.
+pub fn lstm_sequence_fused(
+    hidden: BurnTensor<2>,      // [1, d_hidden]
+    cell: BurnTensor<2>,        // [1, d_hidden]
+    input_gates: BurnTensor<2>, // [steps, 4*d_hidden]
+    weight: BurnTensor<2>,      // [d_hidden, 4*d_hidden]
+    bias: BurnTensor<1>,        // [4*d_hidden]
+) -> (BurnTensor<2>, BurnTensor<2>) {
+    let d_hidden = hidden.dims()[1];
+    let steps = input_gates.dims()[0];
+
+    let state = BurnTensor::cat(vec![hidden, cell], 1).flatten::<1>(0, 1);
+    let output = Dispatch::lstm_sequence_fused(
+        state.into_dispatch(),
+        input_gates.into_dispatch(),
+        weight.into_dispatch(),
+        bias.into_dispatch(),
+    );
+    let packed: BurnTensor<1> = BurnTensor::from_dispatch(output);
+
+    let all_hidden = packed
+        .clone()
+        .slice([0..steps * d_hidden])
+        .reshape([steps, d_hidden]);
+    let last_cell = packed
+        .slice([steps * d_hidden..(steps + 1) * d_hidden])
+        .reshape([1, d_hidden]);
+    (all_hidden, last_cell)
 }
 
 /// Fused single-query attention for f16 tensors.

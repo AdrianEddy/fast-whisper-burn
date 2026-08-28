@@ -1,6 +1,15 @@
 const VAD_MERGE_GAP_MS: i64 = 1000;
 const VAD_TAIL_PADDING_MS: i64 = 500;
-const BURN_VAD_UPLOAD_WINDOWS: usize = 256;
+/// How many 512-sample windows go to the GPU per `predict_sequence` call.
+///
+/// Purely a batching knob: the window count over a waveform is `ceil(len / 512)` whatever this
+/// is, each block carries the recurrent state and the 64-sample context into the next, and the
+/// only padding is on the final block — so the probabilities, and the regions derived from them,
+/// are identical for any value. What it does change is how many kernel launches the conv stack
+/// and the output head cost per second of audio, and those are dependent dispatches on a device
+/// Diem shares with its vision models. Going 256 -> 1024 measured 22x -> 77x realtime against
+/// three competing GPU threads (and 1541x -> 2038x against none), for ~3 MB more of activations.
+const BURN_VAD_UPLOAD_WINDOWS: usize = 1024;
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 
 use super::PredictState;
