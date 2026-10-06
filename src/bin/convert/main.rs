@@ -73,23 +73,23 @@ pub fn load_whisper(pt_path: &str) -> Result<(Whisper, WhisperConfig), Box<dyn E
     let conv1_shape = reader
         .get("encoder.conv1.weight")
         .ok_or("missing encoder.conv1.weight")?
-        .shape
-        .clone();
+        .shape()
+        .to_vec();
     let enc_pos_shape = reader
         .get("encoder.positional_embedding")
         .ok_or("missing encoder.positional_embedding")?
-        .shape
-        .clone();
+        .shape()
+        .to_vec();
     let tok_emb_shape = reader
         .get("decoder.token_embedding.weight")
         .ok_or("missing decoder.token_embedding.weight")?
-        .shape
-        .clone();
+        .shape()
+        .to_vec();
     let dec_pos_shape = reader
         .get("decoder.positional_embedding")
         .ok_or("missing decoder.positional_embedding")?
-        .shape
-        .clone();
+        .shape()
+        .to_vec();
 
     let n_mels = conv1_shape[1];
     let n_audio_state = conv1_shape[0];

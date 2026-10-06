@@ -7,14 +7,6 @@
 //! - Single-query attention: fused Q@K^T·scale→softmax→@V for seq_len=1 decoding
 
 use burn::backend::{Dispatch, backend_extension};
-#[cfg(any(feature = "wgpu", feature = "webgpu"))]
-use burn::backend::Wgpu;
-#[cfg(feature = "vulkan")]
-use burn::backend::Vulkan;
-#[cfg(feature = "metal")]
-use burn::backend::Metal;
-#[cfg(feature = "cuda")]
-use burn::backend::Cuda;
 use burn::nn;
 use burn::tensor::Tensor as BurnTensor;
 use burn_backend::DType;
@@ -23,7 +15,7 @@ use burn_backend::tensor::FloatTensor;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::tensor::CubeTensor;
-use burn_cubecl::{CubeBackend, CubeRuntime};
+use burn_cubecl::CubeBackend;
 use cubecl::prelude::*;
 use cubecl::{CubeCount, CubeDim};
 
@@ -591,11 +583,11 @@ fn fused_single_query_attn_kernel<FIn: Float, FComp: Float>(
 // Low-level launch functions
 // ===========================================================================
 
-fn launch_layer_norm_f16<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    gamma: CubeTensor<R>,
-    beta: CubeTensor<R>,
-) -> CubeTensor<R> {
+fn launch_layer_norm_f16(
+    input: CubeTensor,
+    gamma: CubeTensor,
+    beta: CubeTensor,
+) -> CubeTensor {
     let input = into_contiguous(input);
     let gamma = into_contiguous(gamma);
     let beta = into_contiguous(beta);
@@ -616,7 +608,7 @@ fn launch_layer_norm_f16<R: CubeRuntime>(
     let cube_dim = CubeDim::new_1d(BLOCK_SIZE);
     let cube_count = CubeCount::Static(total_rows as u32, 1, 1);
 
-    layer_norm_f16_kernel::launch::<half::f16, f32, R>(
+    layer_norm_f16_kernel::launch::<half::f16, f32>(
         &client,
         cube_count,
         cube_dim,
@@ -630,7 +622,7 @@ fn launch_layer_norm_f16<R: CubeRuntime>(
     output
 }
 
-fn launch_softmax_f16<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
+fn launch_softmax_f16(input: CubeTensor) -> CubeTensor {
     let input = into_contiguous(input);
 
     let row_size = *input.shape().last().unwrap();
@@ -649,7 +641,7 @@ fn launch_softmax_f16<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
     let cube_dim = CubeDim::new_1d(BLOCK_SIZE);
     let cube_count = CubeCount::Static(total_rows as u32, 1, 1);
 
-    softmax_f16_kernel::launch::<half::f16, f32, R>(
+    softmax_f16_kernel::launch::<half::f16, f32>(
         &client,
         cube_count,
         cube_dim,
@@ -661,11 +653,11 @@ fn launch_softmax_f16<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
     output
 }
 
-fn launch_linear_f16<R: CubeRuntime>(
-    input: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: CubeTensor<R>,
-) -> CubeTensor<R> {
+fn launch_linear_f16(
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> CubeTensor {
     let input = into_contiguous(input);
     let weight = into_contiguous(weight);
     let bias = into_contiguous(bias);
@@ -686,7 +678,7 @@ fn launch_linear_f16<R: CubeRuntime>(
     let cube_dim = CubeDim::new_1d(BLOCK_SIZE);
     let cube_count = CubeCount::Static((total_rows * d_out) as u32, 1, 1);
 
-    linear_f16_kernel::launch::<half::f16, f32, R>(
+    linear_f16_kernel::launch::<half::f16, f32>(
         &client,
         cube_count,
         cube_dim,
@@ -701,13 +693,13 @@ fn launch_linear_f16<R: CubeRuntime>(
     output
 }
 
-fn launch_lstm_cell_fused<R: CubeRuntime>(
-    hidden: CubeTensor<R>,
-    cell: CubeTensor<R>,
-    input_gates: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: CubeTensor<R>,
-) -> CubeTensor<R> {
+fn launch_lstm_cell_fused(
+    hidden: CubeTensor,
+    cell: CubeTensor,
+    input_gates: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> CubeTensor {
     let hidden = into_contiguous(hidden);
     let cell = into_contiguous(cell);
     let input_gates = into_contiguous(input_gates);
@@ -728,7 +720,7 @@ fn launch_lstm_cell_fused<R: CubeRuntime>(
     let cube_dim = CubeDim::new_1d(d_hidden as u32);
     let cube_count = CubeCount::Static(1, 1, 1);
 
-    lstm_cell_kernel::launch::<f32, R>(
+    lstm_cell_kernel::launch::<f32>(
         &client,
         cube_count,
         cube_dim,
@@ -744,12 +736,12 @@ fn launch_lstm_cell_fused<R: CubeRuntime>(
     output
 }
 
-fn launch_lstm_sequence_fused<R: CubeRuntime>(
-    state: CubeTensor<R>,
-    input_gates: CubeTensor<R>,
-    weight: CubeTensor<R>,
-    bias: CubeTensor<R>,
-) -> CubeTensor<R> {
+fn launch_lstm_sequence_fused(
+    state: CubeTensor,
+    input_gates: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> CubeTensor {
     let state = into_contiguous(state);
     let input_gates = into_contiguous(input_gates);
     let weight = into_contiguous(weight);
@@ -770,7 +762,7 @@ fn launch_lstm_sequence_fused<R: CubeRuntime>(
     let cube_dim = CubeDim::new_1d(d_hidden as u32);
     let cube_count = CubeCount::Static(1, 1, 1);
 
-    lstm_sequence_kernel::launch::<f32, R>(
+    lstm_sequence_kernel::launch::<f32>(
         &client,
         cube_count,
         cube_dim,
@@ -786,11 +778,11 @@ fn launch_lstm_sequence_fused<R: CubeRuntime>(
     output
 }
 
-fn launch_fused_single_query_attn<R: CubeRuntime>(
-    q: CubeTensor<R>, // [batch, n_heads, 1, d_k]
-    k: CubeTensor<R>, // [batch, n_heads, n_kv, d_k]
-    v: CubeTensor<R>, // [batch, n_heads, n_kv, d_k]
-) -> CubeTensor<R> {
+fn launch_fused_single_query_attn(
+    q: CubeTensor, // [batch, n_heads, 1, d_k]
+    k: CubeTensor, // [batch, n_heads, n_kv, d_k]
+    v: CubeTensor, // [batch, n_heads, n_kv, d_k]
+) -> CubeTensor {
     let q = into_contiguous(q);
     let k = into_contiguous(k);
     let v = into_contiguous(v);
@@ -819,7 +811,7 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
 
     match q.dtype {
         DType::F16 => {
-            fused_single_query_attn_kernel::launch::<half::f16, f32, R>(
+            fused_single_query_attn_kernel::launch::<half::f16, f32>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -833,7 +825,7 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
             );
         }
         _ => {
-            fused_single_query_attn_kernel::launch::<f32, f32, R>(
+            fused_single_query_attn_kernel::launch::<f32, f32>(
                 &client,
                 cube_count,
                 cube_dim,
@@ -857,10 +849,13 @@ fn launch_fused_single_query_attn<R: CubeRuntime>(
 
 /// Backend extension for fused f16 mixed-precision kernels.
 #[backend_extension(
-    Wgpu: cfg(any(feature = "wgpu", feature = "webgpu")),
-    Vulkan: cfg(feature = "vulkan"),
-    Metal: cfg(feature = "metal"),
-    Cuda: cfg(feature = "cuda"),
+    Cube: cfg(any(
+        feature = "wgpu",
+        feature = "webgpu",
+        feature = "vulkan",
+        feature = "metal",
+        feature = "cuda"
+    )),
 )]
 pub trait CustomKernelsBackend: burn::backend::Backend {
     fn layer_norm_f16(
@@ -906,54 +901,51 @@ pub trait CustomKernelsBackend: burn::backend::Backend {
 }
 
 // Impl for CubeBackend (non-fusion). Wraps backends that are just CubeBackend without Fusion.
-impl<R> CustomKernelsBackend for CubeBackend<R>
-where
-    R: CubeRuntime,
-{
+impl CustomKernelsBackend for CubeBackend {
     fn layer_norm_f16(
-        input: CubeTensor<R>,
-        gamma: CubeTensor<R>,
-        beta: CubeTensor<R>,
-    ) -> CubeTensor<R> {
+        input: CubeTensor,
+        gamma: CubeTensor,
+        beta: CubeTensor,
+    ) -> CubeTensor {
         launch_layer_norm_f16(input, gamma, beta)
     }
 
-    fn softmax_f16(input: CubeTensor<R>) -> CubeTensor<R> {
+    fn softmax_f16(input: CubeTensor) -> CubeTensor {
         launch_softmax_f16(input)
     }
 
     fn linear_f16(
-        input: CubeTensor<R>,
-        weight: CubeTensor<R>,
-        bias: CubeTensor<R>,
-    ) -> CubeTensor<R> {
+        input: CubeTensor,
+        weight: CubeTensor,
+        bias: CubeTensor,
+    ) -> CubeTensor {
         launch_linear_f16(input, weight, bias)
     }
 
     fn lstm_cell_fused(
-        hidden: CubeTensor<R>,
-        cell: CubeTensor<R>,
-        input_gates: CubeTensor<R>,
-        weight: CubeTensor<R>,
-        bias: CubeTensor<R>,
-    ) -> CubeTensor<R> {
+        hidden: CubeTensor,
+        cell: CubeTensor,
+        input_gates: CubeTensor,
+        weight: CubeTensor,
+        bias: CubeTensor,
+    ) -> CubeTensor {
         launch_lstm_cell_fused(hidden, cell, input_gates, weight, bias)
     }
 
     fn lstm_sequence_fused(
-        state: CubeTensor<R>,
-        input_gates: CubeTensor<R>,
-        weight: CubeTensor<R>,
-        bias: CubeTensor<R>,
-    ) -> CubeTensor<R> {
+        state: CubeTensor,
+        input_gates: CubeTensor,
+        weight: CubeTensor,
+        bias: CubeTensor,
+    ) -> CubeTensor {
         launch_lstm_sequence_fused(state, input_gates, weight, bias)
     }
 
     fn fused_single_query_attn(
-        q: CubeTensor<R>,
-        k: CubeTensor<R>,
-        v: CubeTensor<R>,
-    ) -> CubeTensor<R> {
+        q: CubeTensor,
+        k: CubeTensor,
+        v: CubeTensor,
+    ) -> CubeTensor {
         launch_fused_single_query_attn(q, k, v)
     }
 }
@@ -994,13 +986,14 @@ mod fusion_impl {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), burn_backend::ExecutionError> {
                     let ([input, gamma, beta], [output]) = self.desc.as_fixed::<3, 1>();
                     let input = handles.get_float_tensor::<B1>(input);
                     let gamma = handles.get_float_tensor::<B1>(gamma);
                     let beta = handles.get_float_tensor::<B1>(beta);
                     let result = B1::layer_norm_f16(input, gamma, beta);
                     handles.register_float_tensor::<B1>(&output.id, result);
+                    Ok(())
                 }
             }
 
@@ -1044,11 +1037,12 @@ mod fusion_impl {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), burn_backend::ExecutionError> {
                     let ([input], [output]) = self.desc.as_fixed::<1, 1>();
                     let input = handles.get_float_tensor::<B1>(input);
                     let result = B1::softmax_f16(input);
                     handles.register_float_tensor::<B1>(&output.id, result);
+                    Ok(())
                 }
             }
 
@@ -1094,13 +1088,14 @@ mod fusion_impl {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), burn_backend::ExecutionError> {
                     let ([input, weight, bias], [output]) = self.desc.as_fixed::<3, 1>();
                     let input = handles.get_float_tensor::<B1>(input);
                     let weight = handles.get_float_tensor::<B1>(weight);
                     let bias = handles.get_float_tensor::<B1>(bias);
                     let result = B1::linear_f16(input, weight, bias);
                     handles.register_float_tensor::<B1>(&output.id, result);
+                    Ok(())
                 }
             }
 
@@ -1149,7 +1144,7 @@ mod fusion_impl {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), burn_backend::ExecutionError> {
                     let ([state, input_gates, weight, bias], [output]) =
                         self.desc.as_fixed::<4, 1>();
                     let state = handles.get_float_tensor::<B1>(state);
@@ -1158,6 +1153,7 @@ mod fusion_impl {
                     let bias = handles.get_float_tensor::<B1>(bias);
                     let result = B1::lstm_sequence_fused(state, input_gates, weight, bias);
                     handles.register_float_tensor::<B1>(&output.id, result);
+                    Ok(())
                 }
             }
 
@@ -1211,7 +1207,7 @@ mod fusion_impl {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), burn_backend::ExecutionError> {
                     let ([hidden, cell, input_gates, weight, bias], [output]) =
                         self.desc.as_fixed::<5, 1>();
                     let hidden = handles.get_float_tensor::<B1>(hidden);
@@ -1221,6 +1217,7 @@ mod fusion_impl {
                     let bias = handles.get_float_tensor::<B1>(bias);
                     let result = B1::lstm_cell_fused(hidden, cell, input_gates, weight, bias);
                     handles.register_float_tensor::<B1>(&output.id, result);
+                    Ok(())
                 }
             }
 
@@ -1272,13 +1269,14 @@ mod fusion_impl {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), burn_backend::ExecutionError> {
                     let ([q, k, v], [output]) = self.desc.as_fixed::<3, 1>();
                     let q = handles.get_float_tensor::<B1>(q);
                     let k = handles.get_float_tensor::<B1>(k);
                     let v = handles.get_float_tensor::<B1>(v);
                     let result = B1::fused_single_query_attn(q, k, v);
                     handles.register_float_tensor::<B1>(&output.id, result);
+                    Ok(())
                 }
             }
 
