@@ -35,11 +35,15 @@ impl ModuleAdapter for MixedPrecisionAdapter {
         if tensor.dtype != DType::F32 && tensor.dtype != DType::F16 {
             return tensor;
         }
+        // Precision-critical weights are always promoted to f32, even when the checkpoint
+        // stores them as f16 (as OpenAI's official `.pt` files do); passing them through
+        // unchanged leaves f16 weights next to f32 activations.
+        let dtype = if Self::is_precision_critical(&tensor.name) {
+            DType::F32
+        } else {
+            dtype
+        };
         if tensor.dtype == dtype {
-            return tensor;
-        }
-
-        if Self::is_precision_critical(&tensor.name) {
             return tensor;
         }
 
