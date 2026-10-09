@@ -260,15 +260,24 @@ pub fn detect_language(
     sample_rate: usize,
     use_f16_compute: bool,
 ) -> token::Result<LanguageDetectionResult> {
-    assert!(
-        bpe.is_multilingual(),
-        "Language detection requires a multilingual model"
-    );
+    let encoder_output = encode_first_window(whisper, waveform, sample_rate, use_f16_compute)?;
+    detect_language_encoded(whisper, bpe, encoder_output, use_f16_compute)
+}
 
+/// Runs the encoder over the first 30s window of `waveform` (zero-padded if shorter).
+///
+/// Language detection and the first window of transcription both need this; computing it
+/// once and passing it to [`detect_language_encoded`] and [`transcribe_encoded`] saves an
+/// encoder pass when the language is detected before transcribing.
+pub fn encode_first_window(
+    whisper: &Whisper,
+    waveform: &[f32],
+    sample_rate: usize,
+    use_f16_compute: bool,
+) -> std::result::Result<Tensor<3>, pacing::Stopped> {
     let device = whisper.devices()[0].clone();
     let n_mels = whisper.encoder_mel_size();
-    let n_audio_ctx = whisper.encoder_ctx_size();
-    let mel_frame_count = n_audio_ctx * 2;
+    let mel_frame_count = whisper.encoder_ctx_size() * 2;
 
     let full_mel = compute_mel_cpu(waveform, sample_rate, n_mels, &device);
     let [nb, nm, total] = full_mel.dims();
@@ -280,11 +289,39 @@ pub fn detect_language(
         Tensor::cat(vec![full_mel, pad], 2)
     };
 
-    let encoder_output = if use_f16_compute {
-        whisper.forward_encoder_f16(mel_chunk)?
+    if use_f16_compute {
+        whisper.forward_encoder_f16(mel_chunk)
     } else {
-        whisper.forward_encoder(mel_chunk)?
-    };
+        whisper.forward_encoder(mel_chunk)
+    }
+}
+
+/// Like [`detect_language`], from the output of [`encode_first_window`].
+pub fn detect_language_encoded(
+    whisper: &Whisper,
+    bpe: &Gpt2Tokenizer,
+    encoder_output: Tensor<3>,
+    use_f16_compute: bool,
+) -> token::Result<LanguageDetectionResult> {
+    detect_language_among_encoded(whisper, bpe, encoder_output, use_f16_compute, &[])
+}
+
+/// Like [`detect_language_encoded`], choosing only among `candidates` (every language when
+/// empty). When the languages an application will hear are known, restricting detection to
+/// them stops noisy or band-limited audio from being taken for a language it never hears.
+/// The probability returned is still the chosen language's share among all languages.
+pub fn detect_language_among_encoded(
+    whisper: &Whisper,
+    bpe: &Gpt2Tokenizer,
+    encoder_output: Tensor<3>,
+    use_f16_compute: bool,
+    candidates: &[Language],
+) -> token::Result<LanguageDetectionResult> {
+    assert!(
+        bpe.is_multilingual(),
+        "Language detection requires a multilingual model"
+    );
+    let device = whisper.devices()[0].clone();
 
     // Feed SOT token to decoder to get language logits
     let sot_token = bpe.special_token(SpecialToken::StartofTranscript).unwrap();
@@ -312,6 +349,9 @@ pub fn detect_language(
     let mut language_ids = Vec::new();
     let mut languages = Vec::new();
     for lang in <Language as strum::IntoEnumIterator>::iter() {
+        if !candidates.is_empty() && !candidates.iter().any(|c| c.as_str() == lang.as_str()) {
+            continue;
+        }
         if let Some(lang_id) = bpe.special_token(SpecialToken::Language(lang)) {
             language_ids.push(lang_id as i32);
             languages.push(lang);
@@ -357,8 +397,31 @@ pub fn transcribe<F: FnMut(usize, usize) -> bool>(
     )
 }
 
-/// Like `transcribe`, but accepts a pre-computed encoder output to skip encoding.
-/// Used by `transcribe_regions_batched` to amortise encoder cost across regions.
+/// Like [`transcribe`], reusing `encoder_output` from [`encode_first_window`] (same waveform,
+/// same `use_f16_compute`) for the first window instead of encoding it again. It is ignored
+/// when the first window is not the one it encodes: with `offset_ms` or `audio_ctx` set.
+pub fn transcribe_encoded<F: FnMut(usize, usize) -> bool>(
+    whisper: &Whisper,
+    bpe: &Gpt2Tokenizer,
+    waveform: &[f32],
+    sample_rate: usize,
+    params: &WhisperParams,
+    encoder_output: Tensor<3>,
+    progress_callback: Option<F>,
+) -> token::Result<TranscriptionResult> {
+    transcribe_inner(
+        whisper,
+        bpe,
+        waveform,
+        sample_rate,
+        params,
+        Some(encoder_output),
+        progress_callback,
+    )
+}
+
+/// Like `transcribe`, but accepts a pre-computed encoder output of the first window (see
+/// [`encode_first_window`]) to skip encoding it.
 fn transcribe_inner<F: FnMut(usize, usize) -> bool>(
     whisper: &Whisper,
     bpe: &Gpt2Tokenizer,
@@ -423,11 +486,29 @@ fn transcribe_inner<F: FnMut(usize, usize) -> bool>(
         });
     }
 
+    // A first-window encoding is only valid when the first window starts at the beginning
+    // and spans the full audio context.
+    let first_window_is_full = seek_start == 0 && effective_audio_ctx == n_audio_ctx;
+    let mut pre_encoded = pre_encoded.filter(|_| first_window_is_full);
+
     // Language detection
     let lang = if bpe.is_multilingual() {
         let requested_lang = parse_requested_language(&params.language)?;
         if params.detect_language || requested_lang.is_none() {
-            let det = detect_language(whisper, bpe, waveform, sample_rate, params.use_f16_compute)?;
+            // Encode once for both detection and the first window, when they coincide.
+            let encoded = match pre_encoded.take() {
+                Some(encoded) => encoded,
+                None => encode_first_window(whisper, waveform, sample_rate, params.use_f16_compute)?,
+            };
+            let det = detect_language_encoded(
+                whisper,
+                bpe,
+                encoded.clone(),
+                params.use_f16_compute,
+            )?;
+            if first_window_is_full {
+                pre_encoded = Some(encoded);
+            }
             eprintln!(
                 "Auto-detected language: {} (p = {:.4})",
                 det.language.as_str(),
