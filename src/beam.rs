@@ -1,4 +1,5 @@
 ﻿use crate::model::*;
+use crate::pacing;
 use crate::transcribe::{
     CHUNK_SIZE, SamplingStrategy, SegmentDecodeResult, WhisperParams,
     average_cross_attention_for_token, compute_entropy, sequence_score,
@@ -114,7 +115,7 @@ pub(crate) fn decode_segment_beam(
     n_audio_ctx: usize,
     beam_size: usize,
     device: &Device,
-) -> SegmentDecodeResult {
+) -> Result<SegmentDecodeResult, pacing::Stopped> {
     let mut no_speech_prob = 0.0f32;
     let fused_weights = if params.use_f16_compute {
         Some(whisper.build_fused_decoder_weights())
@@ -128,17 +129,30 @@ pub(crate) fn decode_segment_beam(
         TensorData::new(prompt_token_data, [1, initial_tokens.len()]),
         device,
     );
-    let prompt_output = if params.use_f16_compute {
-        whisper.forward_decoder_cached_with_cross_attention_f16(
-            prompt_tensor,
-            whisper.create_decoder_cache_f16(encoder_output.clone()),
-        )
-    } else {
-        whisper.forward_decoder_cached_with_cross_attention(
-            prompt_tensor,
-            whisper.create_decoder_cache(encoder_output.clone()),
-        )
-    };
+    let cost = whisper.cost();
+    let ctx = encoder_output.dims()[1];
+    // One step: the cache and the prompt, then the prompt's cache expanded to `beam_size` along the
+    // batch dim. This single cache persists across all beam steps (no per-step stack/unstack).
+    let start_cost = cost.decoder_start(1, initial_tokens.len(), ctx);
+    let (prompt_output, mut batched_cache) = pacing::step(start_cost, || {
+        let prompt_output = if params.use_f16_compute {
+            whisper.forward_decoder_cached_with_cross_attention_f16(
+                prompt_tensor,
+                whisper.create_decoder_cache_f16(encoder_output.clone()),
+            )
+        } else {
+            whisper.forward_decoder_cached_with_cross_attention(
+                prompt_tensor,
+                whisper.create_decoder_cache(encoder_output.clone()),
+            )
+        };
+        let batched_cache = DecoderCache::stack(
+            (0..beam_size)
+                .map(|_| prompt_output.cache.clone())
+                .collect(),
+        );
+        (prompt_output, batched_cache)
+    })?;
     let prompt_last_pos = initial_tokens.len() - 1;
     let prompt_attention = if params.token_timestamps {
         average_cross_attention_for_token(&prompt_output.cross_attention_weights, prompt_last_pos)
@@ -158,14 +172,6 @@ pub(crate) fn decode_segment_beam(
             .into_scalar::<f32>()
             .elem();
     }
-
-    // Persistent batched cache: expand prompt cache to beam_size along batch dim.
-    // This single cache persists across all beam steps (no per-step stack/unstack).
-    let mut batched_cache = DecoderCache::stack(
-        (0..beam_size)
-            .map(|_| prompt_output.cache.clone())
-            .collect(),
-    );
 
     let mut decoders: Vec<BeamDecoder> = (0..beam_size)
         .map(|_| BeamDecoder {
@@ -505,9 +511,6 @@ pub(crate) fn decode_segment_beam(
             break;
         }
 
-        // Reorder batched cache then run forward pass for all beams
-        batched_cache = batched_cache.reorder_beams(indices_tensor);
-
         // Build token tensor for all beams (dummy token 0 for completed/failed)
         let token_ids: Vec<u32> = decoders
             .iter()
@@ -526,16 +529,20 @@ pub(crate) fn decode_segment_beam(
         let batched_tokens: Tensor<2, Int> =
             Tensor::from_ints(TensorData::new(token_ids, [beam_size, 1]), device);
 
-        let batched_output = if let Some(ref fused) = fused_weights {
-            whisper.forward_decoder_cached_with_cross_attention_fused(
-                batched_tokens,
-                batched_cache,
-                fused,
-                true,
-            )
-        } else {
-            whisper.forward_decoder_cached_with_cross_attention(batched_tokens, batched_cache)
-        };
+        // One step: reorder the batched cache, then the forward pass for all beams
+        let batched_output = pacing::step(cost.decoder_step(beam_size, ctx), || {
+            let batched_cache = batched_cache.reorder_beams(indices_tensor);
+            if let Some(ref fused) = fused_weights {
+                whisper.forward_decoder_cached_with_cross_attention_fused(
+                    batched_tokens,
+                    batched_cache,
+                    fused,
+                    true,
+                )
+            } else {
+                whisper.forward_decoder_cached_with_cross_attention(batched_tokens, batched_cache)
+            }
+        })?;
 
         batched_cache = batched_output.cache;
 
@@ -604,7 +611,7 @@ pub(crate) fn decode_segment_beam(
         })
         .max_by(|a, b| a.sequence.score.partial_cmp(&b.sequence.score).unwrap());
 
-    if let Some(best) = best {
+    Ok(if let Some(best) = best {
         SegmentDecodeResult {
             tokens: best.sequence.tokens,
             token_alignments: best.alignments,
@@ -628,7 +635,7 @@ pub(crate) fn decode_segment_beam(
             no_speech_prob,
             failed: true,
         }
-    }
+    })
 }
 
 fn decoded_tokens_equal(a: &[(usize, f64, usize)], b: &[(usize, f64, usize)]) -> bool {

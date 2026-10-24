@@ -1,6 +1,7 @@
 const VAD_MERGE_GAP_MS: i64 = 1000;
 const VAD_TAIL_PADDING_MS: i64 = 500;
-/// How many 512-sample windows go to the GPU per `predict_sequence` call.
+/// How many 512-sample windows go to the GPU per `predict_sequence` call, at most: fewer when
+/// they don't fit the installed gate's step (`crate::pacing`).
 ///
 /// Purely a batching knob: the window count over a waveform is `ceil(len / 512)` whatever this
 /// is, each block carries the recurrent state and the 64-sample context into the next, and the
@@ -14,6 +15,7 @@ const TARGET_SAMPLE_RATE: u32 = 16_000;
 
 use super::PredictState;
 use super::SileroVAD6Model;
+use crate::{pacing, token};
 use burn::prelude::Tensor;
 
 #[derive(Clone, Copy)]
@@ -254,12 +256,14 @@ pub fn merge_vad_segments(
         .collect()
 }
 
+/// Each block of windows is a step ([`crate::pacing`]); stopped, this fails with
+/// [`pacing::Stopped`].
 pub fn detect_speech_regions<F: FnMut(usize, usize) -> bool>(
     vad: &SileroVAD6Model,
     device: &burn::tensor::Device,
     waveform: &[f32],
     mut progress_callback: Option<F>,
-) -> Result<Vec<SpeechRegion>, String> {
+) -> token::Result<Vec<SpeechRegion>> {
     let mut predict_state = PredictState::default(device);
     let chunk_size = predict_state.input_size();
     let mut speech_probs =
@@ -267,7 +271,13 @@ pub fn detect_speech_regions<F: FnMut(usize, usize) -> bool>(
 
     let mut offset = 0usize;
     while offset < waveform.len() {
-        let block_end = (offset + chunk_size * BURN_VAD_UPLOAD_WINDOWS).min(waveform.len());
+        let windows = pacing::fit(
+            pacing::step_budget(),
+            0.0,
+            pacing::vad(1),
+            BURN_VAD_UPLOAD_WINDOWS,
+        );
+        let block_end = (offset + chunk_size * windows).min(waveform.len());
         let block_len = block_end - offset;
         let padded_block_len = if block_len % chunk_size == 0 {
             block_len
@@ -281,16 +291,17 @@ pub fn detect_speech_regions<F: FnMut(usize, usize) -> bool>(
 
         let block_tensor = Tensor::<1>::from_floats(block.as_slice(), device)
             .reshape([num_windows, chunk_size]);
-        let (new_state, output) = vad
-            .predict_sequence(predict_state, block_tensor)
-            .map_err(|_| "Burn Silero VAD failed".to_string())?;
+        let (new_state, output) = pacing::step(pacing::vad(num_windows), || {
+            vad.predict_sequence(predict_state, block_tensor)
+        })?
+        .map_err(|_| "Burn Silero VAD failed")?;
         predict_state = new_state;
 
         let output_data = output.into_data().convert::<f32>();
         speech_probs.extend_from_slice(
             output_data
                 .as_slice::<f32>()
-                .map_err(|_| "Unexpected Silero VAD output type".to_string())?,
+                .map_err(|_| "Unexpected Silero VAD output type")?,
         );
 
         offset = block_end;

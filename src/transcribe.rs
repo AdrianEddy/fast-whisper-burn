@@ -3,6 +3,7 @@ use crate::beam::{
     decode_segment_beam, decoder_count_for_iteration, effective_beam_size, effective_best_of,
 };
 use crate::model::*;
+use crate::pacing;
 use crate::token::{self, *};
 use burn::tensor::TensorData;
 use burn::{
@@ -280,29 +281,32 @@ pub fn detect_language(
     };
 
     let encoder_output = if use_f16_compute {
-        whisper.forward_encoder_f16(mel_chunk)
+        whisper.forward_encoder_f16(mel_chunk)?
     } else {
-        whisper.forward_encoder(mel_chunk)
+        whisper.forward_encoder(mel_chunk)?
     };
 
     // Feed SOT token to decoder to get language logits
     let sot_token = bpe.special_token(SpecialToken::StartofTranscript).unwrap();
     let token_tensor = Tensor::from_ints(TensorData::new(vec![sot_token as u32], [1, 1]), &device);
-    let logits_tensor = if use_f16_compute {
-        whisper
-            .forward_decoder_cached_with_cross_attention_f16(
-                token_tensor,
-                whisper.create_decoder_cache_f16(encoder_output),
-            )
-            .logits
-    } else {
-        whisper
-            .forward_decoder_cached_with_cross_attention(
-                token_tensor,
-                whisper.create_decoder_cache(encoder_output),
-            )
-            .logits
-    };
+    let start_cost = whisper.cost().decoder_start(1, 1, encoder_output.dims()[1]);
+    let logits_tensor = pacing::step(start_cost, || {
+        if use_f16_compute {
+            whisper
+                .forward_decoder_cached_with_cross_attention_f16(
+                    token_tensor,
+                    whisper.create_decoder_cache_f16(encoder_output),
+                )
+                .logits
+        } else {
+            whisper
+                .forward_decoder_cached_with_cross_attention(
+                    token_tensor,
+                    whisper.create_decoder_cache(encoder_output),
+                )
+                .logits
+        }
+    })?;
     let probs = softmax(logits_tensor.flatten::<1>(0, 2), 0);
 
     let mut language_ids = Vec::new();
@@ -608,14 +612,14 @@ fn transcribe_inner<F: FnMut(usize, usize) -> bool>(
             if seek == seek_start {
                 enc.clone()
             } else if params.use_f16_compute {
-                whisper.forward_encoder_f16(mel_chunk)
+                whisper.forward_encoder_f16(mel_chunk)?
             } else {
-                whisper.forward_encoder(mel_chunk)
+                whisper.forward_encoder(mel_chunk)?
             }
         } else if params.use_f16_compute {
-            whisper.forward_encoder_f16(mel_chunk)
+            whisper.forward_encoder_f16(mel_chunk)?
         } else {
-            whisper.forward_encoder(mel_chunk)
+            whisper.forward_encoder(mel_chunk)?
         };
 
         // Temperature fallback loop
@@ -674,7 +678,7 @@ fn transcribe_inner<F: FnMut(usize, usize) -> bool>(
                 decoder_count,
                 &mut decoder_rngs,
                 &device,
-            );
+            )?;
 
             // Quality check
             // Fallback condition: failed, OR (avg_logprobs < threshold AND no_speech_prob < no_speech_thold)
@@ -1103,8 +1107,19 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
         }
     }
 
-    for chunk_start in (0..batchable_indices.len()).step_by(max_batch) {
-        let chunk_end = (chunk_start + max_batch).min(batchable_indices.len());
+    // A chunk is as many regions as fit the installed gate's step (`pacing`), `max_batch` without.
+    let cost = whisper.cost();
+    let mut next_chunk = 0;
+    while next_chunk < batchable_indices.len() {
+        let chunk_start = next_chunk;
+        let windows = cost.windows_per_batch(
+            beam_size,
+            sot_sequence.len(),
+            effective_audio_ctx,
+            max_batch,
+        );
+        let chunk_end = (chunk_start + windows).min(batchable_indices.len());
+        next_chunk = chunk_end;
         let batch_indices = &batchable_indices[chunk_start..chunk_end];
         let batch_regions: Vec<&[f32]> = batch_indices.iter().map(|&i| regions[i]).collect();
         let batch_size = batch_regions.len();
@@ -1129,9 +1144,9 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
 
         // 2. Batched encoder forward
         let batched_encoder_output = if params.use_f16_compute {
-            whisper.forward_encoder_f16(batched_mel)
+            whisper.forward_encoder_f16(batched_mel)?
         } else {
-            whisper.forward_encoder(batched_mel)
+            whisper.forward_encoder(batched_mel)?
         };
 
         // Beam search: use multi-region batched beam decode
@@ -1155,7 +1170,7 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
                 beam_size,
                 &fused_weights,
                 &device,
-            );
+            )?;
 
             for (r, decode_result) in beam_results.into_iter().enumerate() {
                 // Quality check: fall back to sequential transcribe() with
@@ -1216,35 +1231,36 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
         }
 
         let encoder_output = batched_encoder_output;
+        let ctx = encoder_output.dims()[1];
 
-        // 3. Create batched decoder cache from batched encoder output
-        let cache = if params.use_f16_compute {
-            whisper.create_decoder_cache_f16(encoder_output)
-        } else {
-            whisper.create_decoder_cache(encoder_output)
-        };
-
-        // 4. Batched prompt processing
+        // 3. Batched prompt: [N, prompt_len]
         let prompt: Vec<usize> = sot_sequence.clone();
         let prompt_len = prompt.len();
         let prompt_data: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
-        // Repeat prompt for batch: [N, prompt_len]
         let single_prompt =
             Tensor::<2, Int>::from_ints(TensorData::new(prompt_data, [1, prompt_len]), &device);
         let batched_prompt = single_prompt.repeat_dim(0, batch_size);
 
-        let prompt_output = if let Some(ref fused) = fused_weights {
-            whisper.forward_decoder_cached_with_cross_attention_fused(
-                batched_prompt,
-                cache,
-                fused,
-                true,
-            )
-        } else if params.use_f16_compute {
-            whisper.forward_decoder_cached_with_cross_attention_f16(batched_prompt, cache)
-        } else {
-            whisper.forward_decoder_cached_with_cross_attention(batched_prompt, cache)
-        };
+        // 4. One step: the batched decoder cache from the batched encoder output, then the prompt
+        let prompt_output = pacing::step(cost.decoder_start(batch_size, prompt_len, ctx), || {
+            let cache = if params.use_f16_compute {
+                whisper.create_decoder_cache_f16(encoder_output)
+            } else {
+                whisper.create_decoder_cache(encoder_output)
+            };
+            if let Some(ref fused) = fused_weights {
+                whisper.forward_decoder_cached_with_cross_attention_fused(
+                    batched_prompt,
+                    cache,
+                    fused,
+                    true,
+                )
+            } else if params.use_f16_compute {
+                whisper.forward_decoder_cached_with_cross_attention_f16(batched_prompt, cache)
+            } else {
+                whisper.forward_decoder_cached_with_cross_attention(batched_prompt, cache)
+            }
+        })?;
 
         let mut cache = prompt_output.cache;
         // Extract last-position logits for each region: [N, vocab_size]
@@ -1363,18 +1379,20 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
             );
 
             // Batched forward pass
-            let step_output = if let Some(ref fused) = fused_weights {
-                whisper.forward_decoder_cached_with_cross_attention_fused(
-                    token_tensor,
-                    cache,
-                    fused,
-                    true,
-                )
-            } else if params.use_f16_compute {
-                whisper.forward_decoder_cached_with_cross_attention_f16(token_tensor, cache)
-            } else {
-                whisper.forward_decoder_cached_with_cross_attention(token_tensor, cache)
-            };
+            let step_output = pacing::step(cost.decoder_step(batch_size, ctx), || {
+                if let Some(ref fused) = fused_weights {
+                    whisper.forward_decoder_cached_with_cross_attention_fused(
+                        token_tensor,
+                        cache,
+                        fused,
+                        true,
+                    )
+                } else if params.use_f16_compute {
+                    whisper.forward_decoder_cached_with_cross_attention_f16(token_tensor, cache)
+                } else {
+                    whisper.forward_decoder_cached_with_cross_attention(token_tensor, cache)
+                }
+            })?;
 
             cache = step_output.cache;
 
@@ -1881,53 +1899,57 @@ fn decode_regions_beam_batched(
     beam_size: usize,
     fused_weights: &Option<FusedDecoderWeights>,
     device: &Device,
-) -> Vec<SegmentDecodeResult> {
+) -> std::result::Result<Vec<SegmentDecodeResult>, pacing::Stopped> {
     let total_beams = n_regions * beam_size;
     let delta_min = 10usize;
     let vocab_size = suppress_mask.len();
-
-    // Expand encoder output: each region's encoder output repeated beam_size times
-    // encoder_output is [n_regions, enc_seq, enc_dim]
-    // We need [n_regions * beam_size, enc_seq, enc_dim]
-    let [_, enc_seq, enc_dim] = encoder_output.dims();
-    let expanded_encoder = {
-        // Repeat each region's output beam_size times via repeat_interleave-like operation
-        let mut slices: Vec<Tensor<3>> = Vec::with_capacity(total_beams);
-        for r in 0..n_regions {
-            let region_enc = encoder_output
-                .clone()
-                .slice([r..r + 1, 0..enc_seq, 0..enc_dim]);
-            for _ in 0..beam_size {
-                slices.push(region_enc.clone());
-            }
-        }
-        Tensor::cat(slices, 0)
-    };
-
-    // Create cache and process prompt for all beams
-    let cache = if params.use_f16_compute {
-        whisper.create_decoder_cache_f16(expanded_encoder)
-    } else {
-        whisper.create_decoder_cache(expanded_encoder)
-    };
+    let cost = whisper.cost();
 
     let prompt_data: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
     let single_prompt =
         Tensor::<2, Int>::from_ints(TensorData::new(prompt_data, [1, prompt.len()]), device);
     let batched_prompt = single_prompt.repeat_dim(0, total_beams);
 
-    let prompt_output = if let Some(fused) = fused_weights.as_ref() {
-        whisper.forward_decoder_cached_with_cross_attention_fused(
-            batched_prompt,
-            cache,
-            fused,
-            true,
-        )
-    } else if params.use_f16_compute {
-        whisper.forward_decoder_cached_with_cross_attention_f16(batched_prompt, cache)
-    } else {
-        whisper.forward_decoder_cached_with_cross_attention(batched_prompt, cache)
-    };
+    // encoder_output is [n_regions, enc_seq, enc_dim]
+    let [_, enc_seq, enc_dim] = encoder_output.dims();
+    let start_cost = cost.decoder_start(total_beams, prompt.len(), enc_seq);
+    let prompt_output = pacing::step(start_cost, || {
+        // Expand encoder output: each region's encoder output repeated beam_size times
+        // We need [n_regions * beam_size, enc_seq, enc_dim]
+        let expanded_encoder = {
+            // Repeat each region's output beam_size times via repeat_interleave-like operation
+            let mut slices: Vec<Tensor<3>> = Vec::with_capacity(total_beams);
+            for r in 0..n_regions {
+                let region_enc = encoder_output
+                    .clone()
+                    .slice([r..r + 1, 0..enc_seq, 0..enc_dim]);
+                for _ in 0..beam_size {
+                    slices.push(region_enc.clone());
+                }
+            }
+            Tensor::cat(slices, 0)
+        };
+
+        // Create cache and process prompt for all beams
+        let cache = if params.use_f16_compute {
+            whisper.create_decoder_cache_f16(expanded_encoder)
+        } else {
+            whisper.create_decoder_cache(expanded_encoder)
+        };
+
+        if let Some(fused) = fused_weights.as_ref() {
+            whisper.forward_decoder_cached_with_cross_attention_fused(
+                batched_prompt,
+                cache,
+                fused,
+                true,
+            )
+        } else if params.use_f16_compute {
+            whisper.forward_decoder_cached_with_cross_attention_f16(batched_prompt, cache)
+        } else {
+            whisper.forward_decoder_cached_with_cross_attention(batched_prompt, cache)
+        }
+    })?;
 
     let prompt_last_pos = prompt.len() - 1;
     let mut batched_cache = prompt_output.cache;
@@ -2296,25 +2318,26 @@ fn decode_regions_beam_batched(
         // Reorder cache and run forward pass
         let reorder_tensor =
             Tensor::<1, Int>::from_ints(TensorData::new(global_reorder, [total_beams]), device);
-        batched_cache = batched_cache.reorder_beams(reorder_tensor);
-
         let token_tensor = Tensor::<2, Int>::from_ints(
             TensorData::new(global_next_tokens, [total_beams, 1]),
             device,
         );
 
-        let step_output = if let Some(fused) = fused_weights.as_ref() {
-            whisper.forward_decoder_cached_with_cross_attention_fused(
-                token_tensor,
-                batched_cache,
-                fused,
-                true,
-            )
-        } else if params.use_f16_compute {
-            whisper.forward_decoder_cached_with_cross_attention_f16(token_tensor, batched_cache)
-        } else {
-            whisper.forward_decoder_cached_with_cross_attention(token_tensor, batched_cache)
-        };
+        let step_output = pacing::step(cost.decoder_step(total_beams, enc_seq), || {
+            let batched_cache = batched_cache.reorder_beams(reorder_tensor);
+            if let Some(fused) = fused_weights.as_ref() {
+                whisper.forward_decoder_cached_with_cross_attention_fused(
+                    token_tensor,
+                    batched_cache,
+                    fused,
+                    true,
+                )
+            } else if params.use_f16_compute {
+                whisper.forward_decoder_cached_with_cross_attention_f16(token_tensor, batched_cache)
+            } else {
+                whisper.forward_decoder_cached_with_cross_attention(token_tensor, batched_cache)
+            }
+        })?;
 
         batched_cache = step_output.cache;
 
@@ -2340,7 +2363,7 @@ fn decode_regions_beam_batched(
     }
 
     // Build results per region
-    (0..n_regions)
+    Ok((0..n_regions)
         .map(|r| {
             let beams = &region_beams[r];
             let best = beams
@@ -2394,7 +2417,7 @@ fn decode_regions_beam_batched(
                 }
             }
         })
-        .collect()
+        .collect())
 }
 
 fn tokens_equal(a: &[(usize, f64, usize)], b: &[(usize, f64, usize)]) -> bool {
@@ -2446,7 +2469,7 @@ fn decode_segment(
     beam_size: usize,
     beam_rngs: &mut [MT19937],
     device: &Device,
-) -> SegmentDecodeResult {
+) -> std::result::Result<SegmentDecodeResult, pacing::Stopped> {
     if matches!(params.strategy, SamplingStrategy::BeamSearch { .. })
         && temperature <= 0.0
         && beam_size > 1
@@ -2504,7 +2527,7 @@ fn decode_segment(
                 None
             },
             device,
-        );
+        )?;
 
         if fallback_result.is_none() {
             fallback_result = Some(result.clone());
@@ -2534,7 +2557,7 @@ fn decode_segment(
         }
     }
 
-    best_result.or(fallback_result).unwrap()
+    Ok(best_result.or(fallback_result).unwrap())
 }
 
 fn decode_segment_candidate(
@@ -2558,7 +2581,7 @@ fn decode_segment_candidate(
     use_sampling: bool,
     rng: Option<&mut MT19937>,
     device: &Device,
-) -> SegmentDecodeResult {
+) -> std::result::Result<SegmentDecodeResult, pacing::Stopped> {
     let mut tokens_out: Vec<(usize, f64, usize)> = Vec::new();
     let mut token_alignments: Vec<Vec<f32>> = Vec::new();
     let mut seek_delta = CHUNK_SIZE * 100;
@@ -2583,17 +2606,21 @@ fn decode_segment_candidate(
         TensorData::new(prompt_token_data, [1, full_tokens.len()]),
         device,
     );
-    let prompt_output = if params.use_f16_compute {
-        whisper.forward_decoder_cached_with_cross_attention_f16(
-            prompt_tensor,
-            whisper.create_decoder_cache_f16(encoder_output.clone()),
-        )
-    } else {
-        whisper.forward_decoder_cached_with_cross_attention(
-            prompt_tensor,
-            whisper.create_decoder_cache(encoder_output.clone()),
-        )
-    };
+    let cost = whisper.cost();
+    let ctx = encoder_output.dims()[1];
+    let prompt_output = pacing::step(cost.decoder_start(1, full_tokens.len(), ctx), || {
+        if params.use_f16_compute {
+            whisper.forward_decoder_cached_with_cross_attention_f16(
+                prompt_tensor,
+                whisper.create_decoder_cache_f16(encoder_output.clone()),
+            )
+        } else {
+            whisper.forward_decoder_cached_with_cross_attention(
+                prompt_tensor,
+                whisper.create_decoder_cache(encoder_output.clone()),
+            )
+        }
+    })?;
     let prompt_last_pos = full_tokens.len() - 1;
     let mut cache = prompt_output.cache;
     let mut pending_logits: Tensor<1> = prompt_output
@@ -2840,16 +2867,18 @@ fn decode_segment_candidate(
         // Advance KV cache: feed only the new token through the cached decoder
         let next_token_tensor =
             Tensor::from_ints(TensorData::new(vec![sampled_id as u32], [1, 1]), device);
-        let step_output = if let Some(ref fused) = fused_weights {
-            whisper.forward_decoder_cached_with_cross_attention_fused(
-                next_token_tensor,
-                cache,
-                fused,
-                true,
-            )
-        } else {
-            whisper.forward_decoder_cached_with_cross_attention(next_token_tensor, cache)
-        };
+        let step_output = pacing::step(cost.decoder_step(1, ctx), || {
+            if let Some(ref fused) = fused_weights {
+                whisper.forward_decoder_cached_with_cross_attention_fused(
+                    next_token_tensor,
+                    cache,
+                    fused,
+                    true,
+                )
+            } else {
+                whisper.forward_decoder_cached_with_cross_attention(next_token_tensor, cache)
+            }
+        })?;
         cache = step_output.cache;
         pending_logits = step_output.logits.slice([0..1, 0..1]).flatten::<1>(0, 2);
         pending_attention = if params.token_timestamps {
@@ -2867,7 +2896,7 @@ fn decode_segment_candidate(
     let avg_logprobs = sum_logprobs_subset / n_tokens as f64;
     let entropy = compute_entropy(&tokens_out[..result_len]);
 
-    SegmentDecodeResult {
+    Ok(SegmentDecodeResult {
         tokens: tokens_out,
         token_alignments,
         seek_delta,
@@ -2877,7 +2906,7 @@ fn decode_segment_candidate(
         entropy,
         no_speech_prob,
         failed,
-    }
+    })
 }
 
 /// Compute sequence score with optional length penalty (per whisper.cpp)

@@ -3,6 +3,7 @@ pub mod beam;
 pub mod custom_kernels;
 pub mod helper;
 pub mod model;
+pub mod pacing;
 pub mod token;
 pub mod transcribe;
 pub mod vad;

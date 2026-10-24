@@ -10,6 +10,7 @@
 };
 
 use crate::custom_kernels::{fused_single_query_attn, layer_norm_mixed, softmax_mixed};
+use crate::pacing::{self, Cost, Stopped};
 
 #[derive(Config, Debug)]
 pub struct WhisperConfig {
@@ -41,17 +42,29 @@ pub struct Whisper {
 }
 
 impl Whisper {
-    pub fn forward(&self, mel: Tensor<3>, tokens: Tensor<2, Int>) -> Tensor<3> {
-        let encoder_output = self.encoder.forward(mel, false);
-        self.decoder.forward(tokens, encoder_output)
+    pub fn forward(&self, mel: Tensor<3>, tokens: Tensor<2, Int>) -> Result<Tensor<3>, Stopped> {
+        let encoder_output = self.encoder.forward(mel, false, &self.cost())?;
+        Ok(self.decoder.forward(tokens, encoder_output))
     }
 
-    pub fn forward_encoder(&self, mel: Tensor<3>) -> Tensor<3> {
-        self.encoder.forward(mel, false)
+    /// The encoder over `mel`, paced: the stem and each block are a step ([`crate::pacing`]).
+    pub fn forward_encoder(&self, mel: Tensor<3>) -> Result<Tensor<3>, Stopped> {
+        self.encoder.forward(mel, false, &self.cost())
     }
 
-    pub fn forward_encoder_f16(&self, mel: Tensor<3>) -> Tensor<3> {
-        self.encoder.forward(mel, true)
+    /// [`Self::forward_encoder`] with the blocks in f16.
+    pub fn forward_encoder_f16(&self, mel: Tensor<3>) -> Result<Tensor<3>, Stopped> {
+        self.encoder.forward(mel, true, &self.cost())
+    }
+
+    /// What this model's steps cost ([`crate::pacing`]).
+    pub(crate) fn cost(&self) -> Cost {
+        Cost {
+            d: self.encoder.positional_embedding.dims()[1] as f64,
+            n_mels: self.encoder.n_mels as f64,
+            decoder_layers: self.decoder.blocks.len() as f64,
+            vocab: self.decoder.n_vocab as f64,
+        }
     }
 
     pub fn forward_decoder(
@@ -110,6 +123,10 @@ impl Whisper {
 
     pub fn decoder_layer_count(&self) -> usize {
         self.decoder.layer_count()
+    }
+
+    pub fn encoder_layer_count(&self) -> usize {
+        self.encoder.blocks.len()
     }
 
     /// Pre-compute fused QKV weights for all decoder layers (call once before inference).
@@ -637,8 +654,9 @@ pub struct AudioEncoder {
 }
 
 impl AudioEncoder {
-    fn forward(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
-        let [_, n_mels, _n_ctx] = x.dims();
+    /// Paced: the stem, then each block, is a step of `cost` ([`crate::pacing`]).
+    fn forward(&self, x: Tensor<3>, use_f16: bool, cost: &Cost) -> Result<Tensor<3>, Stopped> {
+        let [batch, n_mels, n_frames] = x.dims();
 
         assert!(
             n_mels == self.n_mels,
@@ -646,46 +664,67 @@ impl AudioEncoder {
             self.n_mels
         );
 
-        // Conv weights are kept in f32 for accuracy; run convs in f32
-        let x = self.gelu1.forward(self.conv1.forward(x));
-        let x = self.gelu2.forward(self.conv2.forward(x));
+        // conv2's stride halves the frames.
+        let ctx = n_frames.div_ceil(2);
 
-        // Cast to f16 after convs for the attention blocks
-        let x = if use_f16 { x.cast(FloatDType::F16) } else { x };
+        let stem = |x: Tensor<3>| {
+            // Conv weights are kept in f32 for accuracy; run convs in f32
+            let x = self.gelu1.forward(self.conv1.forward(x));
+            let x = self.gelu2.forward(self.conv2.forward(x));
 
-        let x = x.swap_dims(1, 2);
-        let k = x.dims()[1];
+            // Cast to f16 after convs for the attention blocks
+            let x = if use_f16 { x.cast(FloatDType::F16) } else { x };
 
-        assert!(
-            k <= self.n_audio_ctx,
-            "Encoded audio context {} exceeds maximum {}. Input mel frames should be at most {}.",
-            k,
-            self.n_audio_ctx,
-            self.n_audio_ctx * 2
-        );
+            let x = x.swap_dims(1, 2);
+            let k = x.dims()[1];
 
-        #[allow(clippy::single_range_in_vec_init)]
-        let pos_emb = self
-            .positional_embedding
-            .val()
-            .slice([0..k])
-            .unsqueeze::<3>();
-        // positional_embedding is kept in f32 for stability, cast to match x
-        let pos_emb = if use_f16 {
-            pos_emb.cast(FloatDType::F16)
-        } else {
-            pos_emb
+            assert!(
+                k <= self.n_audio_ctx,
+                "Encoded audio context {} exceeds maximum {}. Input mel frames should be at most {}.",
+                k,
+                self.n_audio_ctx,
+                self.n_audio_ctx * 2
+            );
+
+            #[allow(clippy::single_range_in_vec_init)]
+            let pos_emb = self
+                .positional_embedding
+                .val()
+                .slice([0..k])
+                .unsqueeze::<3>();
+            // positional_embedding is kept in f32 for stability, cast to match x
+            let pos_emb = if use_f16 {
+                pos_emb.cast(FloatDType::F16)
+            } else {
+                pos_emb
+            };
+            x + pos_emb
         };
-        let x = x + pos_emb;
+        // Its time is linear in the windows, so the stem's steps take as many as fit the gate's
+        // step (all of them without a bound), whatever the blocks' batch.
+        let windows = pacing::fit(pacing::step_budget(), 0.0, cost.encoder_stem(1, ctx), batch);
+        let x = if windows >= batch {
+            pacing::step(cost.encoder_stem(batch, ctx), || stem(x))?
+        } else {
+            let mut parts = Vec::with_capacity(batch.div_ceil(windows));
+            for start in (0..batch).step_by(windows) {
+                let end = (start + windows).min(batch);
+                parts.push(pacing::step(cost.encoder_stem(end - start, ctx), || {
+                    stem(x.clone().slice([start..end]))
+                })?);
+            }
+            Tensor::cat(parts, 0)
+        };
 
+        let block_cost = cost.encoder_block(batch, ctx);
         let mut x = x;
         for block in self.blocks.iter() {
-            x = block.forward(x, use_f16);
+            x = pacing::step(block_cost, || block.forward(x, use_f16))?;
         }
 
         // Cast back to f32 for final LayerNorm
         let x = if use_f16 { x.cast(FloatDType::F32) } else { x };
-        self.ln_post.forward(x)
+        Ok(self.ln_post.forward(x))
     }
 
     fn ctx_size(&self) -> usize {
