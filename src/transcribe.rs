@@ -289,7 +289,7 @@ pub fn detect_language(
     // Feed SOT token to decoder to get language logits
     let sot_token = bpe.special_token(SpecialToken::StartofTranscript).unwrap();
     let token_tensor = Tensor::from_ints(TensorData::new(vec![sot_token as u32], [1, 1]), &device);
-    let start_cost = whisper.cost().decoder_start(1, 1, encoder_output.dims()[1]);
+    let start_cost = whisper.shape().decoder_start(1, 1, encoder_output.dims()[1]);
     let logits_tensor = pacing::step(start_cost, || {
         if use_f16_compute {
             whisper
@@ -1107,12 +1107,13 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
         }
     }
 
-    // A chunk is as many regions as fit the installed gate's step (`pacing`), `max_batch` without.
-    let cost = whisper.cost();
+    // A chunk is as many regions as fit the installed gate's budget (`pacing`); without one,
+    // `max_batch`.
+    let shape = whisper.shape();
     let mut next_chunk = 0;
     while next_chunk < batchable_indices.len() {
         let chunk_start = next_chunk;
-        let windows = cost.windows_per_batch(
+        let windows = shape.windows_per_batch(
             beam_size,
             sot_sequence.len(),
             effective_audio_ctx,
@@ -1242,7 +1243,7 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
         let batched_prompt = single_prompt.repeat_dim(0, batch_size);
 
         // 4. One step: the batched decoder cache from the batched encoder output, then the prompt
-        let prompt_output = pacing::step(cost.decoder_start(batch_size, prompt_len, ctx), || {
+        let prompt_output = pacing::step(shape.decoder_start(batch_size, prompt_len, ctx), || {
             let cache = if params.use_f16_compute {
                 whisper.create_decoder_cache_f16(encoder_output)
             } else {
@@ -1379,7 +1380,7 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
             );
 
             // Batched forward pass
-            let step_output = pacing::step(cost.decoder_step(batch_size, ctx), || {
+            let step_output = pacing::step(shape.decoder_step(batch_size, ctx), || {
                 if let Some(ref fused) = fused_weights {
                     whisper.forward_decoder_cached_with_cross_attention_fused(
                         token_tensor,
@@ -1903,7 +1904,7 @@ fn decode_regions_beam_batched(
     let total_beams = n_regions * beam_size;
     let delta_min = 10usize;
     let vocab_size = suppress_mask.len();
-    let cost = whisper.cost();
+    let shape = whisper.shape();
 
     let prompt_data: Vec<u32> = prompt.iter().map(|&t| t as u32).collect();
     let single_prompt =
@@ -1912,7 +1913,7 @@ fn decode_regions_beam_batched(
 
     // encoder_output is [n_regions, enc_seq, enc_dim]
     let [_, enc_seq, enc_dim] = encoder_output.dims();
-    let start_cost = cost.decoder_start(total_beams, prompt.len(), enc_seq);
+    let start_cost = shape.decoder_start(total_beams, prompt.len(), enc_seq);
     let prompt_output = pacing::step(start_cost, || {
         // Expand encoder output: each region's encoder output repeated beam_size times
         // We need [n_regions * beam_size, enc_seq, enc_dim]
@@ -2323,7 +2324,7 @@ fn decode_regions_beam_batched(
             device,
         );
 
-        let step_output = pacing::step(cost.decoder_step(total_beams, enc_seq), || {
+        let step_output = pacing::step(shape.decoder_step(total_beams, enc_seq), || {
             let batched_cache = batched_cache.reorder_beams(reorder_tensor);
             if let Some(fused) = fused_weights.as_ref() {
                 whisper.forward_decoder_cached_with_cross_attention_fused(
@@ -2606,9 +2607,9 @@ fn decode_segment_candidate(
         TensorData::new(prompt_token_data, [1, full_tokens.len()]),
         device,
     );
-    let cost = whisper.cost();
+    let shape = whisper.shape();
     let ctx = encoder_output.dims()[1];
-    let prompt_output = pacing::step(cost.decoder_start(1, full_tokens.len(), ctx), || {
+    let prompt_output = pacing::step(shape.decoder_start(1, full_tokens.len(), ctx), || {
         if params.use_f16_compute {
             whisper.forward_decoder_cached_with_cross_attention_f16(
                 prompt_tensor,
@@ -2867,7 +2868,7 @@ fn decode_segment_candidate(
         // Advance KV cache: feed only the new token through the cached decoder
         let next_token_tensor =
             Tensor::from_ints(TensorData::new(vec![sampled_id as u32], [1, 1]), device);
-        let step_output = pacing::step(cost.decoder_step(1, ctx), || {
+        let step_output = pacing::step(shape.decoder_step(1, ctx), || {
             if let Some(ref fused) = fused_weights {
                 whisper.forward_decoder_cached_with_cross_attention_fused(
                     next_token_tensor,

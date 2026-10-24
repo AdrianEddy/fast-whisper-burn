@@ -10,7 +10,7 @@
 };
 
 use crate::custom_kernels::{fused_single_query_attn, layer_norm_mixed, softmax_mixed};
-use crate::pacing::{self, Cost, Stopped};
+use crate::pacing::{self, Shape, Stopped};
 
 #[derive(Config, Debug)]
 pub struct WhisperConfig {
@@ -43,23 +43,23 @@ pub struct Whisper {
 
 impl Whisper {
     pub fn forward(&self, mel: Tensor<3>, tokens: Tensor<2, Int>) -> Result<Tensor<3>, Stopped> {
-        let encoder_output = self.encoder.forward(mel, false, &self.cost())?;
+        let encoder_output = self.encoder.forward(mel, false, &self.shape())?;
         Ok(self.decoder.forward(tokens, encoder_output))
     }
 
     /// The encoder over `mel`, paced: the stem and each block are a step ([`crate::pacing`]).
     pub fn forward_encoder(&self, mel: Tensor<3>) -> Result<Tensor<3>, Stopped> {
-        self.encoder.forward(mel, false, &self.cost())
+        self.encoder.forward(mel, false, &self.shape())
     }
 
     /// [`Self::forward_encoder`] with the blocks in f16.
     pub fn forward_encoder_f16(&self, mel: Tensor<3>) -> Result<Tensor<3>, Stopped> {
-        self.encoder.forward(mel, true, &self.cost())
+        self.encoder.forward(mel, true, &self.shape())
     }
 
-    /// What this model's steps cost ([`crate::pacing`]).
-    pub(crate) fn cost(&self) -> Cost {
-        Cost {
+    /// This model's shape, for what its steps cost ([`crate::pacing`]).
+    pub(crate) fn shape(&self) -> Shape {
+        Shape {
             d: self.encoder.positional_embedding.dims()[1] as f64,
             n_mels: self.encoder.n_mels as f64,
             decoder_layers: self.decoder.blocks.len() as f64,
@@ -654,8 +654,8 @@ pub struct AudioEncoder {
 }
 
 impl AudioEncoder {
-    /// Paced: the stem, then each block, is a step of `cost` ([`crate::pacing`]).
-    fn forward(&self, x: Tensor<3>, use_f16: bool, cost: &Cost) -> Result<Tensor<3>, Stopped> {
+    /// Paced: the stem, then each block, is a step ([`crate::pacing`]).
+    fn forward(&self, x: Tensor<3>, use_f16: bool, shape: &Shape) -> Result<Tensor<3>, Stopped> {
         let [batch, n_mels, n_frames] = x.dims();
 
         assert!(
@@ -701,22 +701,22 @@ impl AudioEncoder {
             x + pos_emb
         };
         // Its time is linear in the windows, so the stem's steps take as many as fit the gate's
-        // step (all of them without a bound), whatever the blocks' batch.
-        let windows = pacing::fit(pacing::step_budget(), 0.0, cost.encoder_stem(1, ctx), batch);
+        // budget (all of them without one), whatever the blocks' batch.
+        let windows = pacing::fit(pacing::budget(), |n| shape.encoder_stem(n, ctx), batch);
         let x = if windows >= batch {
-            pacing::step(cost.encoder_stem(batch, ctx), || stem(x))?
+            pacing::step(shape.encoder_stem(batch, ctx), || stem(x))?
         } else {
             let mut parts = Vec::with_capacity(batch.div_ceil(windows));
             for start in (0..batch).step_by(windows) {
                 let end = (start + windows).min(batch);
-                parts.push(pacing::step(cost.encoder_stem(end - start, ctx), || {
+                parts.push(pacing::step(shape.encoder_stem(end - start, ctx), || {
                     stem(x.clone().slice([start..end]))
                 })?);
             }
             Tensor::cat(parts, 0)
         };
 
-        let block_cost = cost.encoder_block(batch, ctx);
+        let block_cost = shape.encoder_block(batch, ctx);
         let mut x = x;
         for block in self.blocks.iter() {
             x = pacing::step(block_cost, || block.forward(x, use_f16))?;

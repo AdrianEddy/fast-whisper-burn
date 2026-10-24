@@ -129,11 +129,11 @@ pub(crate) fn decode_segment_beam(
         TensorData::new(prompt_token_data, [1, initial_tokens.len()]),
         device,
     );
-    let cost = whisper.cost();
+    let shape = whisper.shape();
     let ctx = encoder_output.dims()[1];
     // One step: the cache and the prompt, then the prompt's cache expanded to `beam_size` along the
     // batch dim. This single cache persists across all beam steps (no per-step stack/unstack).
-    let start_cost = cost.decoder_start(1, initial_tokens.len(), ctx);
+    let start_cost = shape.decoder_start(1, initial_tokens.len(), ctx);
     let (prompt_output, mut batched_cache) = pacing::step(start_cost, || {
         let prompt_output = if params.use_f16_compute {
             whisper.forward_decoder_cached_with_cross_attention_f16(
@@ -530,7 +530,7 @@ pub(crate) fn decode_segment_beam(
             Tensor::from_ints(TensorData::new(token_ids, [beam_size, 1]), device);
 
         // One step: reorder the batched cache, then the forward pass for all beams
-        let batched_output = pacing::step(cost.decoder_step(beam_size, ctx), || {
+        let batched_output = pacing::step(shape.decoder_step(beam_size, ctx), || {
             let batched_cache = batched_cache.reorder_beams(indices_tensor);
             if let Some(ref fused) = fused_weights {
                 whisper.forward_decoder_cached_with_cross_attention_fused(

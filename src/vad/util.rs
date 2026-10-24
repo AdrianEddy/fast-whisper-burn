@@ -1,7 +1,7 @@
 const VAD_MERGE_GAP_MS: i64 = 1000;
 const VAD_TAIL_PADDING_MS: i64 = 500;
 /// How many 512-sample windows go to the GPU per `predict_sequence` call, at most: fewer when
-/// they don't fit the installed gate's step (`crate::pacing`).
+/// they don't fit the installed gate's budget (`crate::pacing`).
 ///
 /// Purely a batching knob: the window count over a waveform is `ceil(len / 512)` whatever this
 /// is, each block carries the recurrent state and the 64-sample context into the next, and the
@@ -271,12 +271,7 @@ pub fn detect_speech_regions<F: FnMut(usize, usize) -> bool>(
 
     let mut offset = 0usize;
     while offset < waveform.len() {
-        let windows = pacing::fit(
-            pacing::step_budget(),
-            0.0,
-            pacing::vad(1),
-            BURN_VAD_UPLOAD_WINDOWS,
-        );
+        let windows = pacing::fit(pacing::budget(), pacing::vad, BURN_VAD_UPLOAD_WINDOWS);
         let block_end = (offset + chunk_size * windows).min(waveform.len());
         let block_len = block_end - offset;
         let padded_block_len = if block_len % chunk_size == 0 {
