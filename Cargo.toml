@@ -11,13 +11,13 @@ edition = "2024"
 #burn-ir      = { version = "0.22" }
 #burn-backend = { version = "0.22" }
 #cubecl       = { version = "0.11", features = ["stdlib"] }
-burn         = { git = "https://github.com/tracel-ai/burn", rev = "b31fa6d", default-features = false, features = ["autotune", "fusion", "flex", "extension"] }
-burn-store   = { git = "https://github.com/tracel-ai/burn", rev = "b31fa6d", features = ["std", "pytorch"] }
-burn-cubecl  = { git = "https://github.com/tracel-ai/burn", rev = "b31fa6d" }
-burn-fusion  = { git = "https://github.com/tracel-ai/burn", rev = "b31fa6d" }
-burn-ir      = { git = "https://github.com/tracel-ai/burn", rev = "b31fa6d" }
-burn-backend = { git = "https://github.com/tracel-ai/burn", rev = "b31fa6d" }
-cubecl       = { git = "https://github.com/tracel-ai/cubecl", rev = "0f41bacca8f47c4b9f538cfd364f9ee567eee3d2", features = ["stdlib"] }
+burn         = { git = "https://github.com/tracel-ai/burn", rev = "dd31726", default-features = false, features = ["autotune", "fusion", "flex", "extension"] }
+burn-store   = { git = "https://github.com/tracel-ai/burn", rev = "dd31726", features = ["std", "pytorch"] }
+burn-cubecl  = { git = "https://github.com/tracel-ai/burn", rev = "dd31726" }
+burn-fusion  = { git = "https://github.com/tracel-ai/burn", rev = "dd31726" }
+burn-ir      = { git = "https://github.com/tracel-ai/burn", rev = "dd31726" }
+burn-backend = { git = "https://github.com/tracel-ai/burn", rev = "dd31726" }
+cubecl       = { git = "https://github.com/tracel-ai/cubecl", rev = "907676dca8c4cd407237892cc2915ff6aadc4f1e", features = ["stdlib"] }
 half = "2"
 serde = { version = "1.0", features = ["std", "derive"] }
 hound = "3.5.1"

@@ -8,8 +8,7 @@ pub mod token;
 pub mod transcribe;
 pub mod vad;
 
-use burn_store::burn_pack::Tensor as PackTensor;
-use burn_store::{ModuleAdapter, ModuleContext, bridge};
+use burn_store::{ModuleAdapter, ModuleContext, StoreTensor, bridge};
 
 /// Mixed precision adapter: casts most F32 weights to F16 for faster compute,
 /// but keeps LayerNorm and embedding weights in F32 for numerical stability.
@@ -29,22 +28,22 @@ impl MixedPrecisionAdapter {
 }
 
 impl ModuleAdapter for MixedPrecisionAdapter {
-    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+    fn adapt(&self, tensor: StoreTensor, _ctx: ModuleContext<'_>) -> StoreTensor {
         use burn::tensor::DType;
         let dtype = self.0;
 
-        if tensor.dtype != DType::F32 && tensor.dtype != DType::F16 {
+        if tensor.dtype() != DType::F32 && tensor.dtype() != DType::F16 {
             return tensor;
         }
-        if tensor.dtype == dtype {
-            return tensor;
-        }
-
-        if Self::is_precision_critical(&tensor.name) {
+        if tensor.dtype() == dtype {
             return tensor;
         }
 
-        let (name, shape) = (tensor.name.clone(), tensor.shape.clone());
+        if Self::is_precision_critical(tensor.name()) {
+            return tensor;
+        }
+
+        let (name, shape) = (tensor.name().to_string(), tensor.shape().into());
         bridge::map_data(tensor, name, dtype, shape, move |data| {
             data.convert_dtype(dtype)
         })
