@@ -10,14 +10,15 @@ pub mod vad;
 
 use burn_store::{ModuleAdapter, ModuleContext, StoreTensor, bridge};
 
-/// Mixed precision adapter: casts most F32 weights to F16 for faster compute,
-/// but keeps LayerNorm and embedding weights in F32 for numerical stability.
+/// Mixed precision adapter: casts most weights to the given dtype (F16 for faster compute),
+/// but loads the precision-critical ones as F32 whatever dtype the source stores them in:
+/// the model reads them as F32 in both precisions.
 #[derive(Debug, Clone)]
 pub struct MixedPrecisionAdapter(pub burn::tensor::DType);
 
 impl MixedPrecisionAdapter {
     fn is_precision_critical(name: &str) -> bool {
-        // Keep LayerNorm, positional_embedding, and token_embedding in f32
+        // LayerNorm, the stem's convolutions, cross-attention and both embeddings
         name.contains("ln")
             || name.contains("conv1")
             || name.contains("conv2")
