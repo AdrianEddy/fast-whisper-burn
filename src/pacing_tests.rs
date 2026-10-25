@@ -398,9 +398,18 @@ fn device() -> Device {
     {
         Device::metal(DeviceKind::DefaultDevice)
     }
-    #[cfg(all(not(feature = "vulkan"), not(feature = "metal")))]
+    #[cfg(all(not(feature = "vulkan"), not(feature = "metal"), feature = "wgpu"))]
     {
         Device::wgpu(DeviceKind::DefaultDevice)
+    }
+    #[cfg(all(
+        not(feature = "vulkan"),
+        not(feature = "metal"),
+        not(feature = "wgpu"),
+        feature = "cuda"
+    ))]
+    {
+        Device::cuda(0)
     }
 }
 
