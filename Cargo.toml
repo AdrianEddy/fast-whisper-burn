@@ -4,20 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-#burn         = { version = "0.22", features = ["autotune", "fusion", "flex", "extension"] }
-#burn-store   = { version = "0.22", features = ["std", "pytorch"] }
-#burn-cubecl  = { version = "0.22" }
-#burn-fusion  = { version = "0.22" }
-#burn-ir      = { version = "0.22" }
-#burn-backend = { version = "0.22" }
-#cubecl       = { version = "0.11", features = ["stdlib"] }
-burn         = { git = "https://github.com/tracel-ai/burn", rev = "f0d2b08", default-features = false, features = ["autotune", "fusion", "flex", "extension"] }
-burn-store   = { git = "https://github.com/tracel-ai/burn", rev = "f0d2b08", features = ["std", "pytorch"] }
-burn-cubecl  = { git = "https://github.com/tracel-ai/burn", rev = "f0d2b08" }
-burn-fusion  = { git = "https://github.com/tracel-ai/burn", rev = "f0d2b08" }
-burn-ir      = { git = "https://github.com/tracel-ai/burn", rev = "f0d2b08" }
-burn-backend = { git = "https://github.com/tracel-ai/burn", rev = "f0d2b08" }
-cubecl       = { git = "https://github.com/tracel-ai/cubecl", rev = "9f8a9cc607e5c4fd2c4f6c73743c1b443d18b1ca", features = ["stdlib"] }
+burn         = { version = "0.23.0-pre.1", default-features = false, features = ["autotune", "fusion", "flex", "extension"] }
+burn-store   = { version = "0.23.0-pre.1", features = ["std", "pytorch"] }
+burn-cubecl  = { version = "0.23.0-pre.1" }
+burn-fusion  = { version = "0.23.0-pre.1" }
+burn-ir      = { version = "0.23.0-pre.1" }
+burn-backend = { version = "0.23.0-pre.1" }
+cubecl       = { version = "0.12.0-pre.1", features = ["stdlib"] }
 half = "2"
 serde = { version = "1.0", features = ["std", "derive"] }
 hound = "3.5.1"
