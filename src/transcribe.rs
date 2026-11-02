@@ -374,37 +374,46 @@ pub fn detect_language_among_encoded(
                 .logits
         }
     })?;
-    let probs = softmax(logits_tensor.flatten::<1>(0, 2), 0);
+    // Every language's logit, read back at once. The probability is a softmax over the language
+    // tokens alone, as OpenAI's `detect_language` takes it: after SOT the model also predicts
+    // tokens that are no language (large-v3-turbo puts about half on `<|transcribe|>`), and their
+    // share says nothing about which language is spoken.
+    let (languages, language_ids): (Vec<Language>, Vec<i32>) =
+        <Language as strum::IntoEnumIterator>::iter()
+            .filter_map(|lang| {
+                Some((
+                    lang,
+                    bpe.special_token(SpecialToken::Language(lang))? as i32,
+                ))
+            })
+            .unzip();
+    let language_indices =
+        Tensor::<1, Int>::from_ints(TensorData::new(language_ids, [languages.len()]), &device);
+    let logits = host_values(
+        logits_tensor.flatten::<1>(0, 2).select(0, language_indices),
+        "language logits",
+    )?;
 
-    let mut language_ids = Vec::new();
-    let mut languages = Vec::new();
-    for lang in <Language as strum::IntoEnumIterator>::iter() {
-        if !candidates.is_empty() && !candidates.iter().any(|c| c.as_str() == lang.as_str()) {
-            continue;
-        }
-        if let Some(lang_id) = bpe.special_token(SpecialToken::Language(lang)) {
-            language_ids.push(lang_id as i32);
-            languages.push(lang);
-        }
-    }
-
-    let (best_lang, best_prob) = if language_ids.is_empty() {
-        (Language::English, 0.0f32)
-    } else {
-        let language_indices = Tensor::<1, Int>::from_ints(
-            TensorData::new(language_ids, [languages.len()]),
-            &device,
-        );
-        let language_probs = probs.select(0, language_indices);
-        let (best_prob_tensor, best_index_tensor) = language_probs.topk_with_indices(1, 0);
-        let best_prob: f32 = best_prob_tensor.into_scalar::<f32>().elem();
-        let best_index: i32 = best_index_tensor.into_scalar::<i32>().elem();
-        (languages[best_index as usize], best_prob)
+    let chosen = (0..languages.len())
+        .filter(|&i| {
+            candidates.is_empty()
+                || candidates
+                    .iter()
+                    .any(|c| c.as_str() == languages[i].as_str())
+        })
+        .max_by(|&a, &b| logits[a].total_cmp(&logits[b]));
+    let Some(best) = chosen else {
+        return Ok(LanguageDetectionResult {
+            language: Language::English,
+            probability: 0.0,
+        });
     };
+    let max = logits.iter().copied().fold(logits[best], f32::max);
+    let total: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
 
     Ok(LanguageDetectionResult {
-        language: best_lang,
-        probability: best_prob,
+        language: languages[best],
+        probability: (logits[best] - max).exp() / total,
     })
 }
 

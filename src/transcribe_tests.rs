@@ -1,15 +1,20 @@
-//! What a transcription reads back from the GPU ([`host_values`]).
+//! What a transcription reads back from the GPU ([`host_values`]), and the probability language
+//! detection reports.
 //!
 //! ```text
 //! cargo test --release --no-default-features --features vulkan --lib transcribe::tests
 //! cargo test --release --no-default-features --features vulkan --lib transcribe::tests -- --ignored --nocapture
 //! ```
 //!
-//! The ignored test runs base.en on the GPU, read like the pacing tests' models
+//! The ignored test runs large-v3-turbo on the GPU, read like the pacing tests' models
 //! (`FWB_MODELS`, or else this crate's `models/`), on `audio.wav`.
 
-use super::{NonFinite, host_values, transcribe, transcribe_regions_batched};
+use super::{
+    NonFinite, detect_language, detect_language_among_encoded, encode_first_window, host_values,
+    transcribe, transcribe_regions_batched,
+};
 use crate::pacing::tests::{audio, device, load, params};
+use crate::token::Language;
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, Tensor};
 
@@ -37,8 +42,8 @@ fn masked_logits_are_read_back() {
     assert_eq!(read, [0.5, f32::NEG_INFINITY, 1.0]);
 }
 
-/// Every weight NaN, as a GPU that breaks leaves NaN in Whisper's logits: each decoding path fails
-/// with [`NonFinite`]. They panicked comparing NaN logits before.
+/// Every weight NaN, as a GPU that breaks leaves NaN in Whisper's logits: each decoding path, and
+/// language detection, fails with [`NonFinite`]. They panicked comparing NaN logits before.
 #[test]
 #[ignore = "needs a GPU and Whisper weights"]
 fn nan_logits_fail_every_decoding_path() {
@@ -79,4 +84,43 @@ fn nan_logits_fail_every_decoding_path() {
             .map(drop),
         );
     }
+
+    let (whisper, bpe) = load("base", &device);
+    let whisper = whisper.map(&mut Poison);
+    assert_non_finite(
+        "language detection",
+        detect_language(&whisper, &bpe, &audio, 16_000, true).map(drop),
+    );
+}
+
+/// After SOT, large-v3-turbo puts about half its mass on `<|transcribe|>`, not on a language:
+/// over the whole vocabulary the spoken language had 0.496, over the languages alone 0.9999.
+#[test]
+#[ignore = "needs a GPU and Whisper weights"]
+fn the_language_probability_is_its_share_of_the_languages() {
+    let device = device();
+    let (whisper, bpe) = load("large-v3-turbo", &device);
+    let detected = detect_language(&whisper, &bpe, &audio(), 16_000, true).unwrap();
+    assert_eq!(detected.language.as_str(), "en");
+    assert!(detected.probability > 0.99, "{}", detected.probability);
+
+    let encoded = encode_first_window(&whisper, &audio(), 16_000, true).unwrap();
+    let among = detect_language_among_encoded(
+        &whisper,
+        &bpe,
+        encoded,
+        true,
+        &[Language::Polish, Language::German],
+    )
+    .unwrap();
+    assert!(
+        matches!(among.language, Language::Polish | Language::German),
+        "{}",
+        among.language.as_str()
+    );
+    assert!(
+        among.probability < 0.01,
+        "a language the audio is not still has its share among all: {}",
+        among.probability
+    );
 }
