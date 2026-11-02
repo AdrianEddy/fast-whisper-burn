@@ -2,7 +2,7 @@
 use crate::pacing;
 use crate::transcribe::{
     CHUNK_SIZE, SamplingStrategy, SegmentDecodeResult, WhisperParams,
-    average_cross_attention_for_token, compute_entropy, sequence_score,
+    average_cross_attention_for_token, compute_entropy, host_values, sequence_score,
 };
 use burn::tensor::TensorData;
 use burn::tensor::{
@@ -115,7 +115,7 @@ pub(crate) fn decode_segment_beam(
     n_audio_ctx: usize,
     beam_size: usize,
     device: &Device,
-) -> Result<SegmentDecodeResult, pacing::Stopped> {
+) -> crate::token::Result<SegmentDecodeResult> {
     let mut no_speech_prob = 0.0f32;
     let fused_weights = if params.use_f16_compute {
         Some(whisper.build_fused_decoder_weights())
@@ -155,7 +155,7 @@ pub(crate) fn decode_segment_beam(
     })?;
     let prompt_last_pos = initial_tokens.len() - 1;
     let prompt_attention = if params.token_timestamps {
-        average_cross_attention_for_token(&prompt_output.cross_attention_weights, prompt_last_pos)
+        average_cross_attention_for_token(&prompt_output.cross_attention_weights, prompt_last_pos)?
     } else {
         Vec::new()
     };
@@ -311,11 +311,7 @@ pub(crate) fn decode_segment_beam(
             };
 
             let logprobs_gpu = log_softmax(logits, 0);
-            let mut lp: Vec<f32> = logprobs_gpu
-                .into_data()
-                .convert::<f32>()
-                .to_vec::<f32>()
-                .unwrap();
+            let mut lp: Vec<f32> = host_values(logprobs_gpu, "logits")?;
 
             if !params.no_timestamps {
                 let ts_slice = &lp[token_beg..vocab_size];
@@ -558,7 +554,7 @@ pub(crate) fn decode_segment_beam(
                     .iter()
                     .map(|w| w.clone().slice([decoder_idx..decoder_idx + 1]))
                     .collect();
-                average_cross_attention_for_token(&beam_attn, 0)
+                average_cross_attention_for_token(&beam_attn, 0)?
             } else {
                 Vec::new()
             };

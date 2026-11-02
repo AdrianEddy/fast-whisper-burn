@@ -34,6 +34,21 @@ fn compute_mel_cpu(
     Tensor::<3>::from_data(mel.into_data(), device)
 }
 
+/// `tensor`'s values on the host, as f32; [`NonFinite`]`(what)` where any is NaN.
+pub(crate) fn host_values<const D: usize>(
+    tensor: Tensor<D>,
+    what: &'static str,
+) -> token::Result<Vec<f32>> {
+    let values = tensor
+        .into_data()
+        .try_into_vec_as::<f32>()
+        .map_err(|e| format!("reading Whisper's {what}: {e:?}"))?;
+    if values.iter().any(|v| v.is_nan()) {
+        return Err(Box::new(NonFinite(what)));
+    }
+    Ok(values)
+}
+
 // Non-speech tokens to suppress when suppress_nst is enabled
 // ref: https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/tokenizer.py#L224-L253
 const NON_SPEECH_TOKENS: &[&str] = &[
@@ -229,6 +244,21 @@ pub struct TranscriptionResult {
     pub segments: Vec<TranscriptionSegment>,
     pub text: String,
 }
+
+/// What came back from the GPU with NaN in it, where a transcription reads it: Whisper's logits, or
+/// its cross-attention for token timestamps. A token chosen from them would be noise, and every
+/// comparison that chooses one fails on NaN, so the entry point that read them fails with this:
+/// `err.is::<NonFinite>()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NonFinite(pub &'static str);
+
+impl std::fmt::Display for NonFinite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Whisper's {} came back from the GPU as NaN", self.0)
+    }
+}
+
+impl std::error::Error for NonFinite {}
 
 // ═══════════════════
 // Constants
@@ -1353,8 +1383,7 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
             .reshape([batch_size, vocab_size]);
 
         // Pull all logits to CPU at once
-        let all_logits_data = batched_logits.into_data().convert::<f32>();
-        let all_logits_flat = all_logits_data.to_vec::<f32>().unwrap();
+        let all_logits_flat = host_values(batched_logits, "logits")?;
 
         // Extract per-region cross-attention from prompt output
         let mut pending_attention: Vec<Vec<f32>> = if params.token_timestamps {
@@ -1362,7 +1391,7 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
                 &prompt_output.cross_attention_weights,
                 prompt_len - 1,
                 batch_size,
-            )
+            )?
         } else {
             vec![Vec::new(); batch_size]
         };
@@ -1484,15 +1513,14 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
                     &step_output.cross_attention_weights,
                     0, // single-token step → position 0
                     batch_size,
-                )
+                )?
             } else {
                 vec![Vec::new(); batch_size]
             };
 
             // Pull logits to CPU: [N, 1, vocab_size] → [N * vocab_size]
             let logits_2d: Tensor<2> = step_output.logits.reshape([batch_size, vocab_size]);
-            let logits_data = logits_2d.into_data().convert::<f32>();
-            let logits_flat = logits_data.to_vec::<f32>().unwrap();
+            let logits_flat = host_values(logits_2d, "logits")?;
 
             // Per-region decode on CPU
             for r in 0..batch_size {
@@ -1981,7 +2009,7 @@ fn decode_regions_beam_batched(
     beam_size: usize,
     fused_weights: &Option<FusedDecoderWeights>,
     device: &Device,
-) -> std::result::Result<Vec<SegmentDecodeResult>, pacing::Stopped> {
+) -> token::Result<Vec<SegmentDecodeResult>> {
     let total_beams = n_regions * beam_size;
     let delta_min = 10usize;
     let vocab_size = suppress_mask.len();
@@ -2041,8 +2069,7 @@ fn decode_regions_beam_batched(
         .logits
         .slice([0..total_beams, prompt_last_pos..prompt_last_pos + 1])
         .reshape([total_beams, vocab_size]);
-    let all_logits_data = all_logits.into_data().convert::<f32>();
-    let all_logits_flat = all_logits_data.to_vec::<f32>().unwrap();
+    let all_logits_flat = host_values(all_logits, "logits")?;
 
     // Compute no_speech_prob per region (from first beam of each region)
     let mut no_speech_probs: Vec<f32> = Vec::with_capacity(n_regions);
@@ -2068,7 +2095,7 @@ fn decode_regions_beam_batched(
             &prompt_output.cross_attention_weights,
             prompt.len() - 1,
             total_beams,
-        )
+        )?
     } else {
         vec![Vec::new(); total_beams]
     };
@@ -2429,15 +2456,14 @@ fn decode_regions_beam_batched(
                 &step_output.cross_attention_weights,
                 0, // single-token step → position 0
                 total_beams,
-            )
+            )?
         } else {
             vec![Vec::new(); total_beams]
         };
 
         // Extract per-beam logits
         let logits_2d: Tensor<2> = step_output.logits.reshape([total_beams, vocab_size]);
-        let logits_data = logits_2d.into_data().convert::<f32>();
-        let logits_flat = logits_data.to_vec::<f32>().unwrap();
+        let logits_flat = host_values(logits_2d, "logits")?;
 
         for i in 0..total_beams {
             pending_logits[i] = logits_flat[i * vocab_size..(i + 1) * vocab_size].to_vec();
@@ -2551,7 +2577,7 @@ fn decode_segment(
     beam_size: usize,
     beam_rngs: &mut [MT19937],
     device: &Device,
-) -> std::result::Result<SegmentDecodeResult, pacing::Stopped> {
+) -> token::Result<SegmentDecodeResult> {
     if matches!(params.strategy, SamplingStrategy::BeamSearch { .. })
         && temperature <= 0.0
         && beam_size > 1
@@ -2663,7 +2689,7 @@ fn decode_segment_candidate(
     use_sampling: bool,
     rng: Option<&mut MT19937>,
     device: &Device,
-) -> std::result::Result<SegmentDecodeResult, pacing::Stopped> {
+) -> token::Result<SegmentDecodeResult> {
     let mut tokens_out: Vec<(usize, f64, usize)> = Vec::new();
     let mut token_alignments: Vec<Vec<f32>> = Vec::new();
     let mut seek_delta = CHUNK_SIZE * 100;
@@ -2710,7 +2736,7 @@ fn decode_segment_candidate(
         .slice([0..1, prompt_last_pos..prompt_last_pos + 1])
         .flatten::<1>(0, 2);
     let mut pending_attention: Vec<f32> = if params.token_timestamps {
-        average_cross_attention_for_token(&prompt_output.cross_attention_weights, prompt_last_pos)
+        average_cross_attention_for_token(&prompt_output.cross_attention_weights, prompt_last_pos)?
     } else {
         Vec::new()
     };
@@ -2844,11 +2870,7 @@ fn decode_segment_candidate(
 
         // Log softmax on GPU, then pull to CPU once (single GPU sync instead of ~5 per step)
         let logprobs_gpu = log_softmax(logits, 0);
-        let mut lp: Vec<f32> = logprobs_gpu
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .unwrap();
+        let mut lp: Vec<f32> = host_values(logprobs_gpu, "logits")?;
 
         // Timestamp vs text logprob comparison on CPU
         if !params.no_timestamps {
@@ -2964,7 +2986,7 @@ fn decode_segment_candidate(
         cache = step_output.cache;
         pending_logits = step_output.logits.slice([0..1, 0..1]).flatten::<1>(0, 2);
         pending_attention = if params.token_timestamps {
-            average_cross_attention_for_token(&step_output.cross_attention_weights, 0)
+            average_cross_attention_for_token(&step_output.cross_attention_weights, 0)?
         } else {
             Vec::new()
         };
@@ -3200,16 +3222,16 @@ fn compute_uniform_token_timestamps_for_segment(
 pub(crate) fn average_cross_attention_for_token(
     cross_attention_weights: &[Tensor<4>],
     token_index: usize,
-) -> Vec<f32> {
+) -> token::Result<Vec<f32>> {
     if cross_attention_weights.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Use only the last layer (best alignment signal)
     let layer_weights = cross_attention_weights.last().unwrap();
     let [_batch, n_head, n_qctx, n_ctx] = layer_weights.dims();
     if token_index >= n_qctx {
-        return vec![0.0f32; n_ctx];
+        return Ok(vec![0.0f32; n_ctx]);
     }
 
     // [1, n_head, 1, n_ctx] → [n_head, n_ctx], then max across heads → [n_ctx]
@@ -3218,13 +3240,7 @@ pub(crate) fn average_cross_attention_for_token(
         .slice([0..1, 0..n_head, token_index..token_index + 1, 0..n_ctx])
         .reshape([n_head, n_ctx]);
 
-    heads
-        .max_dim(0)
-        .reshape([n_ctx])
-        .into_data()
-        .convert::<f32>()
-        .to_vec::<f32>()
-        .unwrap()
+    host_values(heads.max_dim(0).reshape([n_ctx]), "cross-attention")
 }
 
 /// Like `average_cross_attention_for_token` but for a batched forward pass.
@@ -3236,16 +3252,16 @@ fn average_cross_attention_batched(
     cross_attention_weights: &[Tensor<4>],
     token_index: usize,
     batch_size: usize,
-) -> Vec<Vec<f32>> {
+) -> token::Result<Vec<Vec<f32>>> {
     if cross_attention_weights.is_empty() || batch_size == 0 {
-        return vec![Vec::new(); batch_size];
+        return Ok(vec![Vec::new(); batch_size]);
     }
 
     // Use only the last layer (best alignment signal)
     let layer_weights = cross_attention_weights.last().unwrap();
     let [_b, n_head, n_qctx, n_ctx] = layer_weights.dims();
     if token_index >= n_qctx {
-        return vec![vec![0.0f32; n_ctx]; batch_size];
+        return Ok(vec![vec![0.0f32; n_ctx]; batch_size]);
     }
 
     // [batch, n_head, 1, n_ctx] → [batch, n_head, n_ctx], max over heads → [batch, n_ctx]
@@ -3260,11 +3276,11 @@ fn average_cross_attention_batched(
         .reshape([batch_size, n_head, n_ctx]);
 
     let maxed: Tensor<2> = heads.max_dim(1).reshape([batch_size, n_ctx]);
-    let flat = maxed.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+    let flat = host_values(maxed, "cross-attention")?;
 
-    (0..batch_size)
+    Ok((0..batch_size)
         .map(|b| flat[b * n_ctx..(b + 1) * n_ctx].to_vec())
-        .collect()
+        .collect())
 }
 
 /// Split a segment into multiple sub-segments if it exceeds max_len characters
@@ -3371,3 +3387,6 @@ pub fn format_timestamp(frames: i64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", h, m % 60, s % 60, ms % 1000)
 }
 
+#[cfg(test)]
+#[path = "transcribe_tests.rs"]
+mod tests;

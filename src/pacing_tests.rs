@@ -389,7 +389,7 @@ fn a_batch_of_windows_fits_the_gate_budget() {
 // Whisper on the GPU
 // ═══════════════════════════════════════════
 
-fn device() -> Device {
+pub(crate) fn device() -> Device {
     #[cfg(feature = "vulkan")]
     {
         Device::vulkan(DeviceKind::DefaultDevice)
@@ -420,7 +420,7 @@ fn models_dir() -> PathBuf {
 }
 
 /// `name`'s f16 weights in mixed precision, as Diem loads them.
-fn load(name: &str, device: &Device) -> (Whisper, Gpt2Tokenizer) {
+pub(crate) fn load(name: &str, device: &Device) -> (Whisper, Gpt2Tokenizer) {
     let dir = models_dir();
     let bpe = Gpt2Tokenizer::new(dir.join(format!("{name}-tokenizer.json")).to_str().unwrap())
         .unwrap_or_else(|e| panic!("{name}'s tokenizer in {}: {e}", dir.display()));
@@ -432,7 +432,7 @@ fn load(name: &str, device: &Device) -> (Whisper, Gpt2Tokenizer) {
     (whisper, bpe)
 }
 
-fn audio() -> Vec<f32> {
+pub(crate) fn audio() -> Vec<f32> {
     let reader = hound::WavReader::open(concat!(env!("CARGO_MANIFEST_DIR"), "/audio.wav")).unwrap();
     assert_eq!(reader.spec().sample_rate, 16_000);
     reader
@@ -442,7 +442,7 @@ fn audio() -> Vec<f32> {
 }
 
 /// Diem's parameters for a model of `beam_size` (1: greedy, as for large-v3-turbo).
-fn params(beam_size: i32) -> WhisperParams {
+pub(crate) fn params(beam_size: i32) -> WhisperParams {
     WhisperParams {
         print_special: false,
         language: "en".to_string(),
