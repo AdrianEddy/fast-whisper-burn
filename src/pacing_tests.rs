@@ -20,7 +20,7 @@ use crate::transcribe::{
 use crate::vad::{SileroVAD6Model, SpeechRegion, detect_speech_regions};
 use burn::backend::Dispatch;
 use burn::config::Config;
-use burn::tensor::{DType, Device, DeviceKind, Distribution, Tensor};
+use burn::tensor::{DType, Device, Distribution, Tensor};
 use burn_backend::{Backend, ProfileOptions, ProfileToken};
 use burn_store::ModuleSnapshot;
 use std::{
@@ -392,15 +392,15 @@ fn a_batch_of_windows_fits_the_gate_budget() {
 pub(crate) fn device() -> Device {
     #[cfg(feature = "vulkan")]
     {
-        Device::vulkan(DeviceKind::DefaultDevice)
+        Device::vulkan(burn::tensor::DeviceKind::DefaultDevice)
     }
     #[cfg(all(not(feature = "vulkan"), feature = "metal"))]
     {
-        Device::metal(DeviceKind::DefaultDevice)
+        Device::metal()
     }
     #[cfg(all(not(feature = "vulkan"), not(feature = "metal"), feature = "wgpu"))]
     {
-        Device::wgpu(DeviceKind::DefaultDevice)
+        Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
     }
     #[cfg(all(
         not(feature = "vulkan"),

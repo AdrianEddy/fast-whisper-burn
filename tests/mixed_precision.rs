@@ -10,7 +10,7 @@
 //! cargo test --release --test mixed_precision
 //! ```
 
-use burn::tensor::{DType, Device, DeviceKind, Distribution, Int, Tensor, TensorData};
+use burn::tensor::{DType, Device, Distribution, Int, Tensor, TensorData};
 use burn_store::{
     BurnpackStore, FloatCastAdapter, ModuleAdapter, ModuleContext, ModuleSnapshot, StoreTensor,
     bridge,
@@ -21,15 +21,15 @@ use fast_whisper_burn::model::{AudioEncoderConfig, TextDecoderConfig, Whisper, W
 fn device() -> Device {
     #[cfg(feature = "vulkan")]
     {
-        Device::vulkan(DeviceKind::DefaultDevice)
+        Device::vulkan(burn::tensor::DeviceKind::DefaultDevice)
     }
     #[cfg(all(not(feature = "vulkan"), feature = "metal"))]
     {
-        Device::metal(DeviceKind::DefaultDevice)
+        Device::metal()
     }
     #[cfg(all(not(feature = "vulkan"), not(feature = "metal")))]
     {
-        Device::wgpu(DeviceKind::DefaultDevice)
+        Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
     }
 }
 

@@ -98,10 +98,36 @@ fn segments_to_text(segments: &[TranscriptSegment]) -> String {
     text
 }
 
+/// The GPU the build's backend feature names, chosen as the tests choose theirs: Vulkan with
+/// `vulkan`, cubecl's own Metal runtime with `metal`, else wgpu's default API (or CUDA).
+fn gpu() -> Device {
+    #[cfg(feature = "vulkan")]
+    {
+        Device::vulkan(burn::tensor::DeviceKind::DefaultDevice)
+    }
+    #[cfg(all(not(feature = "vulkan"), feature = "metal"))]
+    {
+        Device::metal()
+    }
+    #[cfg(all(not(feature = "vulkan"), not(feature = "metal"), feature = "wgpu"))]
+    {
+        Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
+    }
+    #[cfg(all(
+        not(feature = "vulkan"),
+        not(feature = "metal"),
+        not(feature = "wgpu"),
+        feature = "cuda"
+    ))]
+    {
+        Device::cuda(0)
+    }
+}
+
 fn main() {
     //let _ = SimpleLogger::init(LevelFilter::Debug, Default::default());
     let total_started = Instant::now();
-    let tensor_device = Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
+    let tensor_device = gpu();
 
     let args: Vec<String> = env::args().collect();
     let use_f16 = args.iter().any(|a| a == "--f16");

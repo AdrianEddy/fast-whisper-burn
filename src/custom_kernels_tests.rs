@@ -13,20 +13,20 @@
 //! output would scramble every row after the first.
 
 use super::*;
-use burn::tensor::{Device, DeviceKind, FloatDType, TensorData};
+use burn::tensor::{Device, FloatDType, TensorData};
 
 fn device() -> Device {
     #[cfg(feature = "vulkan")]
     {
-        Device::vulkan(DeviceKind::DefaultDevice)
+        Device::vulkan(burn::tensor::DeviceKind::DefaultDevice)
     }
     #[cfg(all(not(feature = "vulkan"), feature = "metal"))]
     {
-        Device::metal(DeviceKind::DefaultDevice)
+        Device::metal()
     }
     #[cfg(all(not(feature = "vulkan"), not(feature = "metal"), feature = "wgpu"))]
     {
-        Device::wgpu(DeviceKind::DefaultDevice)
+        Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)
     }
     #[cfg(all(
         not(feature = "vulkan"),
