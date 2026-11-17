@@ -305,6 +305,27 @@ pub fn encode_first_window(
     sample_rate: usize,
     use_f16_compute: bool,
 ) -> std::result::Result<Tensor<3>, pacing::Stopped> {
+    let mel_chunk = first_window_mel(whisper, waveform, sample_rate);
+    if use_f16_compute {
+        whisper.forward_encoder_f16(mel_chunk)
+    } else {
+        whisper.forward_encoder(mel_chunk)
+    }
+}
+
+/// Each encoder block's MLP input for the first 30s window of `waveform`
+/// ([`Whisper::encoder_mlp_inputs`]): real activations, for a host to check an engine it gives
+/// the encoder's MLPs to ([`crate::offload`]).
+pub fn first_window_mlp_inputs(
+    whisper: &Whisper,
+    waveform: &[f32],
+    sample_rate: usize,
+) -> Vec<Tensor<3>> {
+    whisper.encoder_mlp_inputs(first_window_mel(whisper, waveform, sample_rate))
+}
+
+/// The mel of the first 30s window of `waveform`, zero-padded if shorter.
+fn first_window_mel(whisper: &Whisper, waveform: &[f32], sample_rate: usize) -> Tensor<3> {
     let device = whisper.devices()[0].clone();
     let n_mels = whisper.encoder_mel_size();
     let mel_frame_count = whisper.encoder_ctx_size() * 2;
@@ -312,17 +333,11 @@ pub fn encode_first_window(
     let full_mel = compute_mel_cpu(waveform, sample_rate, n_mels, &device);
     let [nb, nm, total] = full_mel.dims();
 
-    let mel_chunk = if total >= mel_frame_count {
+    if total >= mel_frame_count {
         full_mel.slice([0..nb, 0..nm, 0..mel_frame_count])
     } else {
         let pad = Tensor::zeros([nb, nm, mel_frame_count - total], &device);
         Tensor::cat(vec![full_mel, pad], 2)
-    };
-
-    if use_f16_compute {
-        whisper.forward_encoder_f16(mel_chunk)
-    } else {
-        whisper.forward_encoder(mel_chunk)
     }
 }
 
@@ -1026,6 +1041,10 @@ const DEFAULT_MAX_BATCH_SIZE: usize = 10;
 /// mel spectrogram computation, encoder forward, and greedy decode all run
 /// with batch=N to amortise kernel-launch overhead.
 ///
+/// Where the encoder shares its MLPs with an engine beside the GPU ([`crate::offload`]) and
+/// gains from two lanes, a chunk of one region is encoded with the region after it, a lane each,
+/// and the two are decoded in turn.
+///
 /// Falls back to sequential `transcribe()` for beam-search or sampling
 /// (temperature > 0) strategies.
 pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
@@ -1228,47 +1247,73 @@ pub fn transcribe_regions_batched<F: FnMut(usize, usize) -> bool>(
     }
 
     // A chunk is as many regions as fit the installed gate's budget (`pacing`); without one,
-    // `max_batch`.
+    // `max_batch`. Where the encoder takes a forward of several windows through its blocks as two
+    // lanes (`Whisper::encoder_lanes`), a chunk of one window is encoded together with the window
+    // after it, a lane each, and that one's output waits here for its turn to be decoded. A
+    // chunk of several windows is two lanes by itself.
     let shape = whisper.shape();
     let mut next_chunk = 0;
+    let mut encoded_ahead: Option<(std::ops::Range<usize>, Tensor<3>, Vec<usize>)> = None;
     while next_chunk < batchable_indices.len() {
-        let chunk_start = next_chunk;
-        let windows = shape.windows_per_batch(
-            beam_size,
-            sot_sequence.len(),
-            effective_audio_ctx,
-            max_batch,
-        );
-        let chunk_end = (chunk_start + windows).min(batchable_indices.len());
-        next_chunk = chunk_end;
-        let batch_indices = &batchable_indices[chunk_start..chunk_end];
+        let (chunk, batched_encoder_output, seek_end_per_region) = match encoded_ahead.take() {
+            Some(encoded) => encoded,
+            None => {
+                let windows = shape.windows_per_batch(
+                    beam_size,
+                    sot_sequence.len(),
+                    effective_audio_ctx,
+                    max_batch,
+                );
+                let lanes = if params.use_f16_compute {
+                    whisper.encoder_lanes()
+                } else {
+                    1
+                };
+                let chunk = next_chunk..(next_chunk + windows).min(batchable_indices.len());
+                let paired = chunk.len() == 1 && lanes == 2;
+                let ahead =
+                    chunk.end..(chunk.end + usize::from(paired)).min(batchable_indices.len());
+
+                // 1. Compute mel spectrograms on CPU, then stack and upload
+                let encoded_regions = &batchable_indices[chunk.start..ahead.end];
+                let mut mel_tensors: Vec<Tensor<3>> = Vec::with_capacity(encoded_regions.len());
+                let mut seek_ends: Vec<usize> = Vec::with_capacity(encoded_regions.len());
+                for &region in encoded_regions {
+                    let mel = compute_mel_cpu(regions[region], sample_rate, n_mels, &device);
+                    let [nb, nm, total] = mel.dims();
+                    seek_ends.push(total);
+                    let padded = if total >= mel_frame_count {
+                        mel.slice([0..nb, 0..nm, 0..mel_frame_count])
+                    } else {
+                        let pad = Tensor::zeros([nb, nm, mel_frame_count - total], &device);
+                        Tensor::cat(vec![mel, pad], 2)
+                    };
+                    mel_tensors.push(padded);
+                }
+                // Stack [1, n_mels, mel_frames] × N → [N, n_mels, mel_frames]
+                let batched_mel = Tensor::cat(mel_tensors, 0);
+
+                // 2. Batched encoder forward
+                let encoded = if params.use_f16_compute {
+                    whisper.forward_encoder_f16(batched_mel)?
+                } else {
+                    whisper.forward_encoder(batched_mel)?
+                };
+                if ahead.is_empty() {
+                    (chunk, encoded, seek_ends)
+                } else {
+                    let ahead_seek_ends = seek_ends.split_off(chunk.len());
+                    let ahead_output = encoded.clone().slice([chunk.len()..encoded_regions.len()]);
+                    encoded_ahead = Some((ahead, ahead_output, ahead_seek_ends));
+                    let output = encoded.slice([0..chunk.len()]);
+                    (chunk, output, seek_ends)
+                }
+            }
+        };
+        next_chunk = chunk.end;
+        let batch_indices = &batchable_indices[chunk];
         let batch_regions: Vec<&[f32]> = batch_indices.iter().map(|&i| regions[i]).collect();
         let batch_size = batch_regions.len();
-
-        // 1. Compute mel spectrograms on CPU, then stack and upload
-        let mut mel_tensors: Vec<Tensor<3>> = Vec::with_capacity(batch_size);
-        let mut seek_end_per_region: Vec<usize> = Vec::with_capacity(batch_size);
-        for waveform in batch_regions.iter() {
-            let mel = compute_mel_cpu(waveform, sample_rate, n_mels, &device);
-            let [nb, nm, total] = mel.dims();
-            seek_end_per_region.push(total);
-            let padded = if total >= mel_frame_count {
-                mel.slice([0..nb, 0..nm, 0..mel_frame_count])
-            } else {
-                let pad = Tensor::zeros([nb, nm, mel_frame_count - total], &device);
-                Tensor::cat(vec![mel, pad], 2)
-            };
-            mel_tensors.push(padded);
-        }
-        // Stack [1, n_mels, mel_frames] × N → [N, n_mels, mel_frames]
-        let batched_mel = Tensor::cat(mel_tensors, 0);
-
-        // 2. Batched encoder forward
-        let batched_encoder_output = if params.use_f16_compute {
-            whisper.forward_encoder_f16(batched_mel)?
-        } else {
-            whisper.forward_encoder(batched_mel)?
-        };
 
         // Beam search: use multi-region batched beam decode
         if use_beam {

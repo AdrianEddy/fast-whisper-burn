@@ -60,9 +60,9 @@ fn flops(flops: f64) -> Cost {
 /// The gate is process-wide, so the tests that install one take turns; the turn removes it.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-struct Turn(#[allow(dead_code)] MutexGuard<'static, ()>);
+pub(crate) struct Turn(#[allow(dead_code)] MutexGuard<'static, ()>);
 
-fn turn() -> Turn {
+pub(crate) fn turn() -> Turn {
     Turn(SERIAL.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
@@ -73,7 +73,7 @@ impl Drop for Turn {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Event {
+pub(crate) enum Event {
     Enter(Cost),
     Refused(Cost),
     Queued,
@@ -81,19 +81,19 @@ enum Event {
     Dropped,
 }
 
-type Log = Arc<Mutex<Vec<(ThreadId, Event)>>>;
+pub(crate) type Log = Arc<Mutex<Vec<(ThreadId, Event)>>>;
 
 /// Records every step, refuses the `refuse_at`-th `enter` (counting from 0), and answers
 /// `budget` with `budget`.
 #[derive(Default)]
-struct Recorder {
+pub(crate) struct Recorder {
     budget: Option<(Duration, f64)>,
     refuse_at: Option<usize>,
     log: Log,
 }
 
 impl Recorder {
-    fn installed(budget: Option<(Duration, f64)>, refuse_at: Option<usize>) -> Log {
+    pub(crate) fn installed(budget: Option<(Duration, f64)>, refuse_at: Option<usize>) -> Log {
         let recorder = Recorder {
             budget,
             refuse_at,
@@ -153,7 +153,7 @@ impl Drop for RecordedSlot {
 
 /// The steps `log` saw, in order, after checking that on each thread every `enter` was reported
 /// queued before the next one, on the thread that entered, and that no slot was dropped.
-fn steps(log: &Log) -> Vec<Cost> {
+pub(crate) fn steps(log: &Log) -> Vec<Cost> {
     let log = log.lock().unwrap();
     let mut open: Vec<ThreadId> = Vec::new();
     let mut steps = Vec::new();

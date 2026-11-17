@@ -9,7 +9,10 @@
     tensor::{Bool, Device, Distribution, FloatDType, Int, Tensor, module::embedding},
 };
 
+use std::sync::Arc;
+
 use crate::custom_kernels::{fused_single_query_attn, layer_norm_mixed, softmax_mixed};
+use crate::offload::{MlpEngine, MlpWeights, Offload};
 use crate::pacing::{self, Shape, Stopped};
 
 #[derive(Config, Debug)]
@@ -129,6 +132,59 @@ impl Whisper {
         self.encoder.blocks.len()
     }
 
+    /// Shares the encoder's MLPs with `engine` from the next f16 forward on
+    /// ([`crate::offload`]); `None` keeps them on the GPU. The engine is the host's, built from
+    /// [`Self::encoder_mlp_weights`].
+    pub fn offload_encoder_mlps(&mut self, engine: Option<Arc<dyn MlpEngine>>) {
+        self.set_encoder_offload(engine.map(|engine| Arc::new(Offload::new(engine))));
+    }
+
+    pub(crate) fn set_encoder_offload(&mut self, offload: Option<Arc<Offload>>) {
+        self.encoder.offload = offload;
+    }
+
+    /// The lanes an f16 forward of two windows or more goes through the encoder's blocks in: two
+    /// where its MLPs are shared with an engine beside the GPU and that is measured to gain from
+    /// two ([`crate::offload`]), else one. A caller with one window to encode and another to
+    /// follow encodes both at once where this says two.
+    pub fn encoder_lanes(&self) -> usize {
+        match &self.encoder.offload {
+            Some(offload) => offload.lanes(self.encoder.n_audio_ctx),
+            None => 1,
+        }
+    }
+
+    /// Encoder block `layer`'s MLP over `rows`: a test's engine that is the GPU itself.
+    #[cfg(test)]
+    pub(crate) fn encoder_mlp(&self, layer: usize, rows: Tensor<3>) -> Tensor<3> {
+        self.encoder.blocks[layer].mlp(rows)
+    }
+
+    /// Each encoder block's MLP input (`[windows, positions, width]`, f16) in the f16 forward of
+    /// `mel`, unpaced and all on the GPU: what a host checks its [`MlpEngine`] against, block by
+    /// block.
+    pub fn encoder_mlp_inputs(&self, mel: Tensor<3>) -> Vec<Tensor<3>> {
+        self.encoder.mlp_inputs(mel)
+    }
+
+    /// The MLP of encoder block `layer`, read back from the device: what an [`MlpEngine`] for
+    /// [`Self::offload_encoder_mlps`] is built from.
+    pub fn encoder_mlp_weights(&self, layer: usize) -> MlpWeights {
+        let mlp = &self.encoder.blocks[layer].mlp;
+        // burn keeps a linear layer's weight as `[in, out]`.
+        let weight = |linear: &nn::Linear| values(linear.weight.val().transpose());
+        let bias = |linear: &nn::Linear| {
+            let bias = linear.bias.as_ref().expect("Whisper's MLPs have biases");
+            values(bias.val())
+        };
+        MlpWeights {
+            up: weight(&mlp.lin1),
+            up_bias: bias(&mlp.lin1),
+            down: weight(&mlp.lin2),
+            down_bias: bias(&mlp.lin2),
+        }
+    }
+
     /// Pre-compute fused QKV weights for all decoder layers (call once before inference).
     pub fn build_fused_decoder_weights(&self) -> FusedDecoderWeights {
         let self_attn_qkv = self
@@ -192,6 +248,15 @@ pub struct FusedDecoderWeights {
     /// Pre-computed logit projection matrix: token_embedding transposed + cast to f16
     /// Shape: [1, d_model, vocab_size]
     logit_embed: Tensor<3>,
+}
+
+/// `tensor`'s values, row-major, as float16.
+fn values<const D: usize>(tensor: Tensor<D>) -> Vec<half::f16> {
+    tensor
+        .into_data()
+        .convert::<half::f16>()
+        .try_into_vec::<half::f16>()
+        .expect("converted to float16")
 }
 
 pub struct DecoderForwardOutput {
@@ -636,6 +701,7 @@ impl AudioEncoderConfig {
             positional_embedding,
             n_mels,
             n_audio_ctx,
+            offload: None,
         }
     }
 }
@@ -651,6 +717,9 @@ pub struct AudioEncoder {
     positional_embedding: Param<Tensor<2>>,
     n_mels: usize,
     n_audio_ctx: usize,
+    /// An engine beside the GPU that the blocks' MLPs are shared with ([`crate::offload`]).
+    #[module(skip)]
+    offload: Option<Arc<Offload>>,
 }
 
 impl AudioEncoder {
@@ -667,39 +736,7 @@ impl AudioEncoder {
         // conv2's stride halves the frames.
         let ctx = n_frames.div_ceil(2);
 
-        let stem = |x: Tensor<3>| {
-            // Conv weights are kept in f32 for accuracy; run convs in f32
-            let x = self.gelu1.forward(self.conv1.forward(x));
-            let x = self.gelu2.forward(self.conv2.forward(x));
-
-            // Cast to f16 after convs for the attention blocks
-            let x = if use_f16 { x.cast(FloatDType::F16) } else { x };
-
-            let x = x.swap_dims(1, 2);
-            let k = x.dims()[1];
-
-            assert!(
-                k <= self.n_audio_ctx,
-                "Encoded audio context {} exceeds maximum {}. Input mel frames should be at most {}.",
-                k,
-                self.n_audio_ctx,
-                self.n_audio_ctx * 2
-            );
-
-            #[allow(clippy::single_range_in_vec_init)]
-            let pos_emb = self
-                .positional_embedding
-                .val()
-                .slice([0..k])
-                .unsqueeze::<3>();
-            // positional_embedding is kept in f32 for stability, cast to match x
-            let pos_emb = if use_f16 {
-                pos_emb.cast(FloatDType::F16)
-            } else {
-                pos_emb
-            };
-            x + pos_emb
-        };
+        let stem = |x: Tensor<3>| self.stem(x, use_f16);
         // Its time is linear in the windows, so the stem's steps take as many as fit the gate's
         // budget (all of them without one), whatever the blocks' batch.
         let windows = pacing::fit(pacing::budget(), |n| shape.encoder_stem(n, ctx), batch);
@@ -716,15 +753,70 @@ impl AudioEncoder {
             Tensor::cat(parts, 0)
         };
 
+        // An engine beside the GPU computes in float16, as the f16 blocks do.
+        let offload = self
+            .offload
+            .as_deref()
+            .filter(|offload| use_f16 && offload.working());
+        let (mut x, shared) = match offload {
+            Some(offload) => offload.forward(&self.blocks, x, shape)?,
+            None => (x, 0),
+        };
         let block_cost = shape.encoder_block(batch, ctx);
-        let mut x = x;
-        for block in self.blocks.iter() {
+        for block in &self.blocks[shared..] {
             x = pacing::step(block_cost, || block.forward(x, use_f16))?;
         }
 
         // Cast back to f32 for final LayerNorm
         let x = if use_f16 { x.cast(FloatDType::F32) } else { x };
         Ok(self.ln_post.forward(x))
+    }
+
+    /// The convolution stem over mel `x`, and the positions added: the blocks' input.
+    fn stem(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
+        // Conv weights are kept in f32 for accuracy; run convs in f32
+        let x = self.gelu1.forward(self.conv1.forward(x));
+        let x = self.gelu2.forward(self.conv2.forward(x));
+
+        // Cast to f16 after convs for the attention blocks
+        let x = if use_f16 { x.cast(FloatDType::F16) } else { x };
+
+        let x = x.swap_dims(1, 2);
+        let k = x.dims()[1];
+
+        assert!(
+            k <= self.n_audio_ctx,
+            "Encoded audio context {} exceeds maximum {}. Input mel frames should be at most {}.",
+            k,
+            self.n_audio_ctx,
+            self.n_audio_ctx * 2
+        );
+
+        #[allow(clippy::single_range_in_vec_init)]
+        let pos_emb = self
+            .positional_embedding
+            .val()
+            .slice([0..k])
+            .unsqueeze::<3>();
+        // positional_embedding is kept in f32 for stability, cast to match x
+        let pos_emb = if use_f16 {
+            pos_emb.cast(FloatDType::F16)
+        } else {
+            pos_emb
+        };
+        x + pos_emb
+    }
+
+    /// Each block's MLP input in the f16 forward of mel `x` ([`Whisper::encoder_mlp_inputs`]).
+    fn mlp_inputs(&self, x: Tensor<3>) -> Vec<Tensor<3>> {
+        let mut x = self.stem(x, true);
+        let mut inputs = Vec::with_capacity(self.blocks.len());
+        for block in &self.blocks {
+            let (residual, input) = block.attend(x, true);
+            x = residual + block.mlp(input.clone());
+            inputs.push(input);
+        }
+        inputs
     }
 
     fn ctx_size(&self) -> usize {
@@ -775,14 +867,27 @@ pub struct ResidualEncoderAttentionBlock {
 const ENCODER_ATTN_CHUNK: usize = 256;
 
 impl ResidualEncoderAttentionBlock {
-    fn forward(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
+    pub(crate) fn forward(&self, x: Tensor<3>, use_f16: bool) -> Tensor<3> {
+        let (x, mlp_input) = self.attend(x, use_f16);
+        x + self.mlp.forward(mlp_input)
+    }
+
+    /// The block's attention half: the residual with the attention's output added, and that
+    /// normalized for the MLP, whose output ([`Self::mlp`]) added to the residual completes the
+    /// block.
+    pub(crate) fn attend(&self, x: Tensor<3>, use_f16: bool) -> (Tensor<3>, Tensor<3>) {
         let ln_out = layer_norm_mixed(&self.attn_ln, x.clone(), use_f16);
         let attn_out = self.chunked_self_attention(ln_out, use_f16);
 
         let x = x + attn_out;
 
         let mlp_input = layer_norm_mixed(&self.mlp_ln, x.clone(), use_f16);
-        x + self.mlp.forward(mlp_input)
+        (x, mlp_input)
+    }
+
+    /// The block's MLP over `rows` (`[.., positions, width]`), each position by itself.
+    pub(crate) fn mlp(&self, rows: Tensor<3>) -> Tensor<3> {
+        self.mlp.forward(rows)
     }
 
     /// Chunked self-attention: processes queries in blocks of ENCODER_ATTN_CHUNK

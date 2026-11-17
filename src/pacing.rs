@@ -182,6 +182,24 @@ impl Shape {
         }
     }
 
+    /// An encoder block's attention half: all of the block but its MLP, where the two are steps
+    /// of their own ([`crate::offload`]). The block's fixed time is this half's.
+    pub(crate) fn encoder_attention(&self, batch: usize, ctx: usize) -> Cost {
+        let block = self.encoder_block(batch, ctx);
+        Cost {
+            flops: block.flops - self.encoder_mlp(batch * ctx).flops,
+            fixed: block.fixed,
+        }
+    }
+
+    /// An encoder block's MLP over `rows` positions: 16·d² a position, at the block's efficiency.
+    pub(crate) fn encoder_mlp(&self, rows: usize) -> Cost {
+        Cost {
+            flops: rows as f64 * 16.0 * self.d * self.d / ENCODER_BLOCK_EFFICIENCY,
+            fixed: Duration::ZERO,
+        }
+    }
+
     /// The decoder's start for `batch` sequences: every layer's cross-attention keys and values,
     /// then a pass over the prompt's `tokens`.
     pub(crate) fn decoder_start(&self, batch: usize, tokens: usize, ctx: usize) -> Cost {
