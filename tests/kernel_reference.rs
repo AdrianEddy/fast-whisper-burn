@@ -53,7 +53,7 @@ fn upload<const D: usize>(
 }
 
 fn download<const D: usize>(t: Tensor<D>) -> Vec<f32> {
-    t.into_data().convert::<f32>().into_vec::<f32>().unwrap()
+    t.into_data().convert::<f32>().try_into_vec::<f32>().unwrap()
 }
 
 /// Rounding the f32 result to the output dtype is the only error a kernel is allowed: half an

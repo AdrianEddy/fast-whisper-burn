@@ -105,7 +105,7 @@ fn reference(inputs: &Inputs, steps: usize) -> (Vec<f32>, Vec<f32>) {
 }
 
 fn to_vec(t: Tensor<2>) -> Vec<f32> {
-    t.into_data().convert::<f32>().into_vec::<f32>().unwrap()
+    t.into_data().convert::<f32>().try_into_vec::<f32>().unwrap()
 }
 
 fn assert_matches(label: &str, got: &[f32], want: &[f32]) {
